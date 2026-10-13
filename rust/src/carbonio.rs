@@ -272,6 +272,8 @@ pub struct CarbonioFolder {
     pub parent_id: Option<String>,
     pub name: String,
     pub view: Option<String>,
+    /// Item count Carbonio reports for this folder (`n` in `GetFolderResponse`).
+    pub item_count: u32,
 }
 
 fn flatten_folder(node: &RawFolder, parent_id: Option<String>, out: &mut Vec<CarbonioFolder>) {
@@ -283,6 +285,7 @@ fn flatten_folder(node: &RawFolder, parent_id: Option<String>, out: &mut Vec<Car
             parent_id,
             name: node.name.clone(),
             view: node.view.clone(),
+            item_count: node.n,
         });
     }
     for child in &node.folder {
@@ -308,6 +311,8 @@ struct RawFolder {
     id: String,
     name: String,
     view: Option<String>,
+    #[serde(default)]
+    n: u32,
     #[serde(default)]
     folder: Vec<RawFolder>,
 }
@@ -777,6 +782,7 @@ mod tests {
                                 "id": "2",
                                 "name": "Inbox",
                                 "view": "message",
+                                "n": 5,
                                 "folder": [
                                     {"id": "6", "name": "Sub", "view": "message"}
                                 ]
@@ -802,18 +808,21 @@ mod tests {
                     parent_id: Some("1".into()),
                     name: "Inbox".into(),
                     view: Some("message".into()),
+                    item_count: 5,
                 },
                 CarbonioFolder {
                     id: "6".into(),
                     parent_id: Some("2".into()),
                     name: "Sub".into(),
                     view: Some("message".into()),
+                    item_count: 0,
                 },
                 CarbonioFolder {
                     id: "10".into(),
                     parent_id: Some("1".into()),
                     name: "Calendar".into(),
                     view: Some("appointment".into()),
+                    item_count: 0,
                 },
             ]
         );

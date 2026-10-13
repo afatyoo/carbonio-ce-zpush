@@ -8,6 +8,7 @@ pub const PAGE_CONTACTS: u8 = 0x01;
 pub const PAGE_EMAIL: u8 = 0x02;
 pub const PAGE_CALENDAR: u8 = 0x04;
 pub const PAGE_FOLDERHIERARCHY: u8 = 0x07;
+pub const PAGE_ITEMESTIMATE: u8 = 0x06;
 pub const PAGE_PING: u8 = 0x0D;
 pub const PAGE_PROVISION: u8 = 0x0E;
 
@@ -95,6 +96,24 @@ const FOLDERHIERARCHY_TAGS: &[(u8, &str)] = &[
     (0x15, "FolderUpdate"),
     (0x16, "FolderSync"),
     (0x17, "Count"),
+];
+
+/// ItemEstimate (codepage 6) tags, [MS-ASWBXML] 2.1.2.6. NOTE: these token
+/// values are reproduced from memory of the spec, not re-checked against
+/// the published MS-ASWBXML document or a real device, unlike the other
+/// tables here which were validated live against Carbonio. Treat this one
+/// as unverified until a real ActiveSync client's GetItemEstimate request
+/// has been captured and compared against it.
+const ITEMESTIMATE_TAGS: &[(u8, &str)] = &[
+    (0x05, "GetItemEstimate"),
+    (0x06, "Collections"),
+    (0x07, "Collection"),
+    (0x08, "Class"),
+    (0x09, "CollectionId"),
+    (0x0A, "DateTime"),
+    (0x0B, "Estimate"),
+    (0x0C, "Response"),
+    (0x0D, "Status"),
 ];
 
 /// Ping (codepage 13) tags, [MS-ASWBXML] 2.1.2.13.
@@ -219,6 +238,12 @@ pub fn folderhierarchy_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> 
 pub fn folderhierarchy_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
     build_encode_table(PAGE_FOLDERHIERARCHY, FOLDERHIERARCHY_TAGS)
 }
+pub fn itemestimate_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
+    build_decode_table(PAGE_ITEMESTIMATE, ITEMESTIMATE_TAGS)
+}
+pub fn itemestimate_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
+    build_encode_table(PAGE_ITEMESTIMATE, ITEMESTIMATE_TAGS)
+}
 pub fn ping_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
     build_decode_table(PAGE_PING, PING_TAGS)
 }
@@ -277,6 +302,7 @@ mod tests {
             (contacts_decode_table(), contacts_encode_table()),
             (calendar_decode_table(), calendar_encode_table()),
             (folderhierarchy_decode_table(), folderhierarchy_encode_table()),
+            (itemestimate_decode_table(), itemestimate_encode_table()),
             (ping_decode_table(), ping_encode_table()),
             (provision_decode_table(), provision_encode_table()),
         ] {

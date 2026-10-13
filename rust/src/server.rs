@@ -2,9 +2,10 @@ use crate::activesync_http::{ensure_supported_command, parse_activesync_query, p
 use crate::carbonio::CarbonioClient;
 use crate::codepages::{
     activesync_folder_type, airsync_encode_table, airsync_item_page_of, calendar_encode_table,
-    contacts_encode_table, email_encode_table, folderhierarchy_encode_table, merge_encode_tables,
-    ping_encode_table, provision_encode_table, PAGE_CALENDAR, PAGE_CONTACTS, PAGE_EMAIL,
-    PAGE_FOLDERHIERARCHY, PAGE_PING, PAGE_PROVISION,
+    contacts_encode_table, email_encode_table, folderhierarchy_encode_table, itemestimate_decode_table,
+    itemestimate_encode_table, merge_encode_tables, ping_encode_table, provision_encode_table,
+    PAGE_CALENDAR, PAGE_CONTACTS, PAGE_EMAIL, PAGE_FOLDERHIERARCHY, PAGE_ITEMESTIMATE, PAGE_PING,
+    PAGE_PROVISION,
 };
 use crate::mime_lite::parse_rfc822;
 use crate::sync_state::SyncStateStore;
@@ -119,6 +120,7 @@ async fn handle_activesync(
         "Provision" => handle_provision(),
         "Ping" => handle_ping(),
         "SendMail" => handle_send_mail(&client, &body).await,
+        "GetItemEstimate" => handle_get_item_estimate(&client, &body).await,
         other => (
             StatusCode::NOT_IMPLEMENTED,
             format!("'{other}' is accepted but not yet wired to a Carbonio handler"),
@@ -517,6 +519,63 @@ fn handle_ping() -> Response {
 
     let encode_table = ping_encode_table();
     let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &|_name| PAGE_PING) {
+        Ok(bytes) => bytes,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
+    };
+    (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
+}
+
+/// Handles `GetItemEstimate`: reports how many items are in the requested
+/// collection, from Carbonio's own per-folder count (`GetFolderRequest`'s
+/// `n` field), without fetching the items themselves. WBXML token values
+/// for this command's codepage are unverified against a real device (see
+/// `codepages::ITEMESTIMATE_TAGS`); this has only been exercised with
+/// hand-built WBXML in this project's own tests.
+async fn handle_get_item_estimate(client: &CarbonioClient, body: &[u8]) -> Response {
+    let decode_table = itemestimate_decode_table();
+    let nodes = match WbxmlDecoder::new(body, &decode_table).decode() {
+        Ok(n) => n,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("failed to decode GetItemEstimate body: {e}")).into_response(),
+    };
+    let collection_id = match find_text_child(&nodes, "CollectionId") {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, "GetItemEstimate body missing CollectionId").into_response(),
+    };
+
+    let folders = match client.get_folders().await {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("GetFolder from Carbonio failed: {e}")).into_response(),
+    };
+    let estimate = folders.iter().find(|f| f.id == collection_id).map(|f| f.item_count).unwrap_or(0);
+
+    let tree = vec![WbxmlNode::Tag {
+        name: "GetItemEstimate".into(),
+        children: vec![WbxmlNode::Tag {
+            name: "Response".into(),
+            children: vec![
+                WbxmlNode::Tag {
+                    name: "Status".into(),
+                    children: vec![WbxmlNode::Text("1".into())],
+                },
+                WbxmlNode::Tag {
+                    name: "Collection".into(),
+                    children: vec![
+                        WbxmlNode::Tag {
+                            name: "CollectionId".into(),
+                            children: vec![WbxmlNode::Text(collection_id)],
+                        },
+                        WbxmlNode::Tag {
+                            name: "Estimate".into(),
+                            children: vec![WbxmlNode::Text(estimate.to_string())],
+                        },
+                    ],
+                },
+            ],
+        }],
+    }];
+
+    let encode_table = itemestimate_encode_table();
+    let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &|_name| PAGE_ITEMESTIMATE) {
         Ok(bytes) => bytes,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
     };

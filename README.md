@@ -23,8 +23,11 @@ Early, working foundation, not yet feature-complete. Verified end-to-end against
 - [x] `SendMail` command: parses the device's raw RFC 822 body (headers + plain text, no multipart/MIME yet) and relays it to Carbonio. Verified end-to-end: sent a real message that landed in a live mailbox
 - [x] `Sync` command for contacts: same SyncKey machinery as email, backed by `SearchRequest types=contact`. `Sync` picks email vs. contacts per collection automatically by checking that folder's Carbonio `view` via `GetFolderRequest`. Verified end-to-end against a real contact (name, email, mobile number)
 - [x] `Sync` command for calendar events: backed by `SearchRequest types=appointment`. Only a recurring event's first occurrence is synced (no recurrence rule), and there are no attendees or reminders. Verified end-to-end: subject, location, start, and end time all matched a real appointment
-- [ ] Tasks item sync: `Sync`-ing a Tasks folder still returns an explicit `501 Not Implemented` (checked live) instead of silently returning nothing or wrong-shaped data
-- [ ] `ItemOperations`, `GetItemEstimate`
+- [x] `GetItemEstimate`: returns a collection's item count straight from Carbonio's own per-folder count (`GetFolderRequest`'s `n` field), no need to fetch the items themselves to count them. Verified end-to-end against a real folder count. WBXML token values for this command's codepage are reproduced from memory and not independently re-checked against the spec text or a real device, unlike every other codepage table here
+
+Email, Contacts, and Calendar cover every item type this Carbonio CE instance actually has. Tasks is not implemented, and isn't tracked as a gap: this Carbonio CE build has no Tasks folder at all, and rejects `SearchRequest types=task` outright with `invalid item type: task`. Tasks appears to be a Carbonio Advanced (paid) feature, not something missing from this rewrite.
+
+- [ ] `ItemOperations` (attachment download)
 - [ ] HTML bodies and attachments in `SendMail` (multipart/MIME parsing)
 - [ ] Real push: `Ping` needs a Carbonio-side change notification to actually block until new mail arrives
 - [ ] FolderSync's own SyncKey is still hardcoded to "1" on every call, unlike the per-collection Sync command, which now tracks a real key
@@ -75,11 +78,11 @@ scp root@<carbonio-host>:/opt/zextras/ssl/carbonio/server/server.crt rust/certs/
 | `src/carbonio.rs` | SOAP/JSON client to Carbonio CE (`urn:zimbraAccount`, `urn:zimbraMail`) |
 | `src/tls_pinning.rs` | Custom `rustls` certificate verifier for pinned-cert mode |
 | `src/wbxml.rs` | WBXML binary codec (encode/decode), codepage-table driven |
-| `src/codepages.rs` | WBXML codepage token tables (AirSync, Email, Contacts, Calendar, FolderHierarchy, Ping, Provision) and Carbonio→ActiveSync folder type mapping |
+| `src/codepages.rs` | WBXML codepage token tables (AirSync, Email, Contacts, Calendar, FolderHierarchy, ItemEstimate, Ping, Provision) and Carbonio→ActiveSync folder type mapping |
 | `src/sync_state.rs` | SyncKey store, per (user, device, collection), with optional JSON-file persistence |
 | `src/mime_lite.rs` | Minimal RFC 822 header/body parser for `SendMail` bodies |
 | `src/activesync_http.rs` | ActiveSync HTTP framing: Basic Auth header, `Cmd`/`User`/`DeviceId`/`DeviceType` query parsing |
-| `src/server.rs` | `axum` HTTP server, command dispatch (`FolderSync`, `Sync`, `Provision`, `Ping`, `SendMail`) |
+| `src/server.rs` | `axum` HTTP server, command dispatch (`FolderSync`, `Sync`, `Provision`, `Ping`, `SendMail`, `GetItemEstimate`) |
 
 ## Why Rust
 
