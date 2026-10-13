@@ -282,7 +282,13 @@ async fn handle_sync(
     let (new_key, adds) = if client_sync_key == "0" {
         let adds = match &kind {
             CollectionKind::Email => match client.search_messages(&collection_id, 25).await {
-                Ok(messages) => messages.iter().map(email_to_add_node).collect(),
+                Ok(messages) => {
+                    let mut nodes = Vec::with_capacity(messages.len());
+                    for m in &messages {
+                        nodes.push(email_to_add_node(client, m).await);
+                    }
+                    nodes
+                }
                 Err(e) => return (StatusCode::BAD_GATEWAY, format!("SearchRequest from Carbonio failed: {e}")).into_response(),
             },
             CollectionKind::Contacts => match client.search_contacts(&collection_id, 100).await {
@@ -305,7 +311,63 @@ async fn handle_sync(
     build_sync_response(&collection_id, "1", &new_key, adds, &kind)
 }
 
-fn email_to_add_node(m: &crate::carbonio::CarbonioMessage) -> WbxmlNode {
+/// Builds a Sync `<Add>` node for one email. When the message has an
+/// attachment (per the search result's own flag), this makes one extra
+/// `GetMsgRequest` round trip to list the attachment parts, so a device
+/// has a `FileReference` to `Fetch` later -- only paid for messages that
+/// actually have attachments, not every message in the folder.
+async fn email_to_add_node(client: &CarbonioClient, m: &crate::carbonio::CarbonioMessage) -> WbxmlNode {
+    let mut application_data = vec![
+        WbxmlNode::Tag {
+            name: "Subject".into(),
+            children: vec![WbxmlNode::Text(m.subject.clone())],
+        },
+        WbxmlNode::Tag {
+            name: "From".into(),
+            children: vec![WbxmlNode::Text(m.from.clone().unwrap_or_default())],
+        },
+        WbxmlNode::Tag {
+            name: "Read".into(),
+            children: vec![WbxmlNode::Text(if m.unread { "0" } else { "1" }.into())],
+        },
+    ];
+
+    if m.has_attachment {
+        if let Ok(details) = client.get_message_details(&m.id).await {
+            if !details.attachments.is_empty() {
+                let attachment_nodes = details
+                    .attachments
+                    .iter()
+                    .map(|a| WbxmlNode::Tag {
+                        name: "Attachment".into(),
+                        children: vec![
+                            WbxmlNode::Tag {
+                                name: "AttName".into(),
+                                children: vec![WbxmlNode::Text(a.filename.clone())],
+                            },
+                            WbxmlNode::Tag {
+                                name: "AttSize".into(),
+                                children: vec![WbxmlNode::Text(a.size.to_string())],
+                            },
+                            WbxmlNode::Tag {
+                                name: "Att0Id".into(),
+                                children: vec![WbxmlNode::Text(format!("{}:{}", m.id, a.part_id))],
+                            },
+                            WbxmlNode::Tag {
+                                name: "AttMethod".into(),
+                                children: vec![WbxmlNode::Text("1".into())],
+                            },
+                        ],
+                    })
+                    .collect();
+                application_data.push(WbxmlNode::Tag { name: "Attachments".into(), children: attachment_nodes });
+            }
+        }
+        // A failed detail lookup here just means the device won't see an
+        // attachment list for this one message; the message itself still
+        // syncs normally rather than failing the whole Sync response.
+    }
+
     WbxmlNode::Tag {
         name: "Add".into(),
         children: vec![
@@ -313,23 +375,7 @@ fn email_to_add_node(m: &crate::carbonio::CarbonioMessage) -> WbxmlNode {
                 name: "ServerId".into(),
                 children: vec![WbxmlNode::Text(m.id.clone())],
             },
-            WbxmlNode::Tag {
-                name: "ApplicationData".into(),
-                children: vec![
-                    WbxmlNode::Tag {
-                        name: "Subject".into(),
-                        children: vec![WbxmlNode::Text(m.subject.clone())],
-                    },
-                    WbxmlNode::Tag {
-                        name: "From".into(),
-                        children: vec![WbxmlNode::Text(m.from.clone().unwrap_or_default())],
-                    },
-                    WbxmlNode::Tag {
-                        name: "Read".into(),
-                        children: vec![WbxmlNode::Text(if m.unread { "0" } else { "1" }.into())],
-                    },
-                ],
-            },
+            WbxmlNode::Tag { name: "ApplicationData".into(), children: application_data },
         ],
     }
 }
@@ -615,19 +661,33 @@ async fn handle_get_item_estimate(client: &CarbonioClient, body: &[u8]) -> Respo
 /// Contacts/Calendar Fetch). WBXML token values for this command's
 /// codepage are unverified against a real device, same caveat as
 /// `GetItemEstimate` -- see `codepages::ITEMOPERATIONS_TAGS`.
+/// `FileReference` for an attachment is our own opaque scheme:
+/// `"<message_id>:<part_id>"`, generated when listing attachments on a
+/// Sync Add node (see `email_to_add_node`) and parsed back out here. Real
+/// devices treat `FileReference` as opaque, so round-tripping our own
+/// format through it is safe.
+fn parse_attachment_file_reference(file_reference: &str) -> Option<(&str, &str)> {
+    file_reference.split_once(':')
+}
+
 async fn handle_item_operations(client: &CarbonioClient, body: &[u8]) -> Response {
     let decode_table = itemoperations_decode_table();
     let nodes = match WbxmlDecoder::new(body, &decode_table).decode() {
         Ok(n) => n,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("failed to decode ItemOperations body: {e}")).into_response(),
     };
+
+    if let Some(file_reference) = find_text_child(&nodes, "FileReference") {
+        return handle_fetch_attachment(client, file_reference).await;
+    }
+
     let server_id = match find_text_child(&nodes, "ServerId") {
         Some(id) => id,
-        None => return (StatusCode::BAD_REQUEST, "ItemOperations Fetch missing ServerId").into_response(),
+        None => return (StatusCode::BAD_REQUEST, "ItemOperations Fetch missing ServerId/FileReference").into_response(),
     };
 
-    let message_body = match client.get_message_body(&server_id).await {
-        Ok(b) => b,
+    let details = match client.get_message_details(&server_id).await {
+        Ok(d) => d,
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("GetMsg from Carbonio failed: {e}")).into_response(),
     };
 
@@ -655,7 +715,7 @@ async fn handle_item_operations(client: &CarbonioClient, body: &[u8]) -> Respons
                             name: "Properties".into(),
                             children: vec![WbxmlNode::Tag {
                                 name: "Body".into(),
-                                children: vec![WbxmlNode::Text(message_body)],
+                                children: vec![WbxmlNode::Text(details.body)],
                             }],
                         },
                     ],
@@ -667,6 +727,68 @@ async fn handle_item_operations(client: &CarbonioClient, body: &[u8]) -> Respons
     let encode_table = merge_encode_tables(vec![itemoperations_encode_table(), email_encode_table()]);
     let page_of = |name: &str| if name == "Body" { PAGE_EMAIL } else { PAGE_ITEMOPERATIONS };
     let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &page_of) {
+        Ok(bytes) => bytes,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
+    };
+    (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
+}
+
+/// Handles an attachment `Fetch`: downloads the raw bytes via Carbonio's
+/// REST content endpoint and returns them base64-encoded under
+/// `Properties/Data`, per MS-ASCMD's ItemOperations response schema for
+/// attachments (unlike a message body, which is returned as plain text).
+async fn handle_fetch_attachment(client: &CarbonioClient, file_reference: String) -> Response {
+    let Some((message_id, part_id)) = parse_attachment_file_reference(&file_reference) else {
+        return (StatusCode::BAD_REQUEST, "FileReference was not in the expected 'message_id:part_id' form").into_response();
+    };
+
+    let (_, content_type, data) = match client.download_attachment(message_id, part_id).await {
+        Ok(result) => result,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("attachment download from Carbonio failed: {e}")).into_response(),
+    };
+    let encoded_data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
+
+    let tree = vec![WbxmlNode::Tag {
+        name: "ItemOperations".into(),
+        children: vec![
+            WbxmlNode::Tag {
+                name: "Status".into(),
+                children: vec![WbxmlNode::Text("1".into())],
+            },
+            WbxmlNode::Tag {
+                name: "Response".into(),
+                children: vec![WbxmlNode::Tag {
+                    name: "Fetch".into(),
+                    children: vec![
+                        WbxmlNode::Tag {
+                            name: "Status".into(),
+                            children: vec![WbxmlNode::Text("1".into())],
+                        },
+                        WbxmlNode::Tag {
+                            name: "FileReference".into(),
+                            children: vec![WbxmlNode::Text(file_reference)],
+                        },
+                        WbxmlNode::Tag {
+                            name: "Properties".into(),
+                            children: vec![
+                                WbxmlNode::Tag {
+                                    name: "ContentType".into(),
+                                    children: vec![WbxmlNode::Text(content_type)],
+                                },
+                                WbxmlNode::Tag {
+                                    name: "Data".into(),
+                                    children: vec![WbxmlNode::Text(encoded_data)],
+                                },
+                            ],
+                        },
+                    ],
+                }],
+            },
+        ],
+    }];
+
+    let encode_table = itemoperations_encode_table();
+    let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &|_name| PAGE_ITEMOPERATIONS) {
         Ok(bytes) => bytes,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
     };

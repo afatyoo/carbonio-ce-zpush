@@ -65,9 +65,15 @@ const CALENDAR_TAGS: &[(u8, &str)] = &[
 /// Email (codepage 2) tags, [MS-ASWBXML] 2.1.2.3. Minimal field set for a
 /// readable message list (no attachments/MIME/meeting-request fields yet).
 const EMAIL_TAGS: &[(u8, &str)] = &[
-    // Deprecated in EAS 14.0+ (modern clients expect Body under the
-    // AirSyncBase codepage instead, which this project doesn't model yet);
-    // kept here as the simplest way to carry Fetch's body text for now.
+    // Deprecated in EAS 14.0+ (modern clients expect Attachments/Body
+    // under the AirSyncBase codepage instead, which this project doesn't
+    // model yet); kept here as the simplest way to carry this data for now.
+    (0x05, "Attachment"),
+    (0x06, "Attachments"),
+    (0x07, "AttName"),
+    (0x08, "AttSize"),
+    (0x09, "Att0Id"),
+    (0x0A, "AttMethod"),
     (0x0C, "Body"),
     (0x0F, "DateReceived"),
     (0x11, "DisplayTo"),
@@ -159,6 +165,7 @@ const ITEMOPERATIONS_TAGS: &[(u8, &str)] = &[
     (0x07, "Store"),
     (0x08, "Options"),
     (0x0B, "Properties"),
+    (0x0C, "Data"),
     (0x0D, "Status"),
     (0x0E, "Response"),
     // Not part of the official ItemOperations codepage (the spec reuses
@@ -166,6 +173,10 @@ const ITEMOPERATIONS_TAGS: &[(u8, &str)] = &[
     // simplification already used for ITEMESTIMATE_TAGS's own CollectionId.
     (0x10, "ServerId"),
     (0x11, "CollectionId"),
+    // Also not verified against the spec's own token for these (see the
+    // module-level NOTE above); self-contained for the same reason.
+    (0x12, "FileReference"),
+    (0x13, "ContentType"),
 ];
 
 /// ActiveSync folder type codes (MS-ASCMD 2.2.3.165.1) for the Carbonio/Zimbra

@@ -356,6 +356,10 @@ pub struct CarbonioMessage {
     /// Milliseconds since the Unix epoch, as Zimbra/Carbonio reports it.
     pub date_epoch_ms: i64,
     pub unread: bool,
+    /// From the search result's own flag string (`f` contains `a`), so
+    /// callers can decide whether a further `get_message_details` call is
+    /// worth making to list the actual attachments.
+    pub has_attachment: bool,
 }
 
 impl CarbonioClient {
@@ -416,9 +420,9 @@ impl CarbonioClient {
         Ok(raw_messages.into_iter().map(RawMessage::into_carbonio_message).collect())
     }
 
-    /// Sends a plain-text email via `SendMsgRequest` (`urn:zimbraMail`).
-    /// Does not support HTML bodies or attachments yet; `to`/`cc` are the
-    /// raw address strings as parsed from the device's RFC 822 headers.
+    /// Sends an email via `SendMsgRequest` (`urn:zimbraMail`), with an
+    /// optional HTML alternative body and optional attachments (already
+    /// uploaded via [`Self::upload_attachment`]).
     pub async fn send_message(&self, msg: &OutgoingMessage) -> Result<()> {
         let token = self
             .auth_token
@@ -643,15 +647,17 @@ impl CarbonioClient {
         Ok(raw_appts.into_iter().map(RawAppointment::into_carbonio_appointment).collect())
     }
 
-    /// Fetches a message's plain-text body via `GetMsgRequest`
-    /// (`urn:zimbraMail`). Returns the first MIME part marked `body: true`
-    /// with a `text/plain` content type; HTML-only messages and messages
-    /// with no plain-text part return an empty string rather than an error.
-    pub async fn get_message_body(&self, message_id: &str) -> Result<String> {
+    /// Fetches a message's plain-text body and attachment list via
+    /// `GetMsgRequest` (`urn:zimbraMail`). The body is the first MIME part
+    /// (searched recursively, since a `multipart/alternative` nests its
+    /// parts one level deeper) marked `body: true` with a `text/plain`
+    /// content type; HTML-only messages and messages with no plain-text
+    /// part get an empty body string rather than an error.
+    pub async fn get_message_details(&self, message_id: &str) -> Result<MessageDetails> {
         let token = self
             .auth_token
             .as_deref()
-            .context("get_message_body called before authenticate")?;
+            .context("get_message_details called before authenticate")?;
 
         let request_body = json!({
             "Body": {
@@ -699,12 +705,60 @@ impl CarbonioClient {
             .next()
             .context("GetMsgResponse had no message")?;
 
-        Ok(message
-            .mp
+        let mut attachments = Vec::new();
+        collect_attachments(&message.mp, &mut attachments);
+
+        let mut leaves = Vec::new();
+        collect_leaf_parts(&message.mp, &mut leaves);
+        let body = leaves
             .into_iter()
             .find(|part| part.body && part.ct == "text/plain")
             .map(|part| part.content)
-            .unwrap_or_default())
+            .unwrap_or_default();
+
+        Ok(MessageDetails { body, attachments })
+    }
+
+    /// Downloads one attachment's raw bytes via the REST
+    /// `/service/content/get` endpoint (not SOAP; like upload, Carbonio's
+    /// attachment content retrieval only exists as REST). Returns the
+    /// filename and content type Carbonio reports in the response headers.
+    pub async fn download_attachment(&self, message_id: &str, part_id: &str) -> Result<(String, String, Vec<u8>)> {
+        let token = self.auth_token.as_deref().context("download_attachment called before authenticate")?;
+        let url = format!(
+            "{}/service/content/get?id={message_id}&part={part_id}",
+            self.base_url.trim_end_matches('/')
+        );
+
+        let response = self
+            .http
+            .get(&url)
+            .header("Cookie", format!("ZM_AUTH_TOKEN={token}"))
+            .send()
+            .await
+            .context("attachment download failed to reach Carbonio")?;
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .split(';')
+            .next()
+            .unwrap_or("application/octet-stream")
+            .trim()
+            .to_string();
+
+        let filename = response
+            .headers()
+            .get("content-disposition")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split("filename=").nth(1))
+            .map(|v| v.trim_matches('"').to_string())
+            .unwrap_or_else(|| "attachment".to_string());
+
+        let bytes = response.bytes().await.context("failed to read attachment download body")?;
+        Ok((filename, content_type, bytes.to_vec()))
     }
 
     /// Fetches the authenticated account's own id via `GetInfoRequest`
@@ -920,11 +974,77 @@ struct RawFullMessage {
 
 #[derive(Debug, Deserialize)]
 struct RawMimePart {
+    part: String,
     ct: String,
     #[serde(default)]
     body: bool,
     #[serde(default)]
     content: String,
+    #[serde(default)]
+    cd: String,
+    #[serde(default)]
+    filename: String,
+    /// Part size in bytes, as Carbonio reports it (0 for container parts).
+    #[serde(default)]
+    s: u64,
+    #[serde(default)]
+    mp: Vec<RawMimePart>,
+}
+
+/// One attachment on a message, identified by its MIME part id (needed to
+/// fetch its content later via [`CarbonioClient::download_attachment`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentRef {
+    pub part_id: String,
+    pub filename: String,
+    pub content_type: String,
+    pub size: u64,
+}
+
+/// Flattens a message's MIME part tree, collecting every part whose
+/// content-disposition is `attachment`.
+fn collect_attachments(parts: &[RawMimePart], out: &mut Vec<AttachmentRef>) {
+    for part in parts {
+        if part.cd == "attachment" {
+            out.push(AttachmentRef {
+                part_id: part.part.clone(),
+                filename: part.filename.clone(),
+                content_type: part.ct.clone(),
+                size: part.s,
+            });
+        }
+        collect_attachments(&part.mp, out);
+    }
+}
+
+/// Flattens a message's MIME part tree into every leaf part (parts with no
+/// children), regardless of disposition -- used to find the plain-text
+/// body part wherever it's nested (e.g. inside `multipart/alternative`).
+fn collect_leaf_parts(parts: &[RawMimePart], out: &mut Vec<RawMimePart>) {
+    for part in parts {
+        if part.mp.is_empty() {
+            out.push(RawMimePart {
+                part: part.part.clone(),
+                ct: part.ct.clone(),
+                body: part.body,
+                content: part.content.clone(),
+                cd: part.cd.clone(),
+                filename: part.filename.clone(),
+                s: part.s,
+                mp: Vec::new(),
+            });
+        } else {
+            collect_leaf_parts(&part.mp, out);
+        }
+    }
+}
+
+/// A message's plain-text body plus its attachment list, from
+/// [`CarbonioClient::get_message_details`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageDetails {
+    pub body: String,
+    pub attachments: Vec<AttachmentRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1056,7 +1176,13 @@ struct SearchResponse {
 #[derive(Debug, Deserialize)]
 struct RawMessage {
     id: String,
-    su: Option<ContentField>,
+    /// A bare string here (unlike `GetMsgRequest`'s structured fields),
+    /// confirmed live: `SearchResponse.m[].su` is plain JSON text, not
+    /// `{"_content": ...}`. This mismatch went unnoticed for a while
+    /// because every earlier live Sync test happened to hit an empty
+    /// Inbox, so `su` was never actually deserialized until a folder with
+    /// real messages was synced.
+    su: Option<String>,
     /// Date in milliseconds since the Unix epoch.
     d: Option<i64>,
     /// Flag string; Zimbra/Carbonio uses 'u' for unread among others.
@@ -1082,11 +1208,12 @@ impl RawMessage {
             .collect();
         CarbonioMessage {
             id: self.id,
-            subject: self.su.map(|s| s.content).unwrap_or_default(),
+            subject: self.su.unwrap_or_default(),
             from,
             to,
             date_epoch_ms: self.d.unwrap_or(0),
             unread: self.f.as_deref().is_some_and(|flags| flags.contains('u')),
+            has_attachment: self.f.as_deref().is_some_and(|flags| flags.contains('a')),
         }
     }
 }
@@ -1191,16 +1318,16 @@ mod tests {
 
     #[test]
     fn search_response_maps_sender_recipients_and_unread_flag() {
-        // Shape matches a real SearchRequest hit: one unread message from
-        // alice to bob and carol.
+        // Shape matches a real SearchRequest hit: one unread message with
+        // an attachment, from alice to bob and carol.
         let raw = r#"{
             "Body": {
                 "SearchResponse": {
                     "m": [{
                         "id": "123",
-                        "su": {"_content": "Weekly report"},
+                        "su": "Weekly report",
                         "d": 1760000000000,
-                        "f": "u",
+                        "f": "ua",
                         "e": [
                             {"a": "alice@afatyo.com", "t": "f"},
                             {"a": "bob@afatyo.com", "t": "t"},
@@ -1226,6 +1353,7 @@ mod tests {
                 to: vec!["bob@afatyo.com".into(), "carol@afatyo.com".into()],
                 date_epoch_ms: 1760000000000,
                 unread: true,
+                has_attachment: true,
             }]
         );
     }
@@ -1235,7 +1363,7 @@ mod tests {
         let raw = r#"{
             "Body": {
                 "SearchResponse": {
-                    "m": [{"id": "1", "su": {"_content": "Hi"}, "d": 1, "e": []}]
+                    "m": [{"id": "1", "su": "Hi", "d": 1, "e": []}]
                 }
             },
             "_jsns": "urn:zimbraSoap"
@@ -1378,7 +1506,9 @@ mod tests {
         }"#;
         let envelope: SoapEnvelope<GetMsgBody> = serde_json::from_str(raw).unwrap();
         let message = envelope.body.get_msg_response.unwrap().m.into_iter().next().unwrap();
-        let body = message.mp.into_iter().find(|p| p.body && p.ct == "text/plain").map(|p| p.content);
+        let mut leaves = Vec::new();
+        collect_leaf_parts(&message.mp, &mut leaves);
+        let body = leaves.into_iter().find(|p| p.body && p.ct == "text/plain").map(|p| p.content);
         assert_eq!(body, Some("Hello body text".to_string()));
     }
 
@@ -1394,8 +1524,88 @@ mod tests {
         }"#;
         let envelope: SoapEnvelope<GetMsgBody> = serde_json::from_str(raw).unwrap();
         let message = envelope.body.get_msg_response.unwrap().m.into_iter().next().unwrap();
-        let body = message.mp.into_iter().find(|p| p.body && p.ct == "text/plain").map(|p| p.content);
+        let mut leaves = Vec::new();
+        collect_leaf_parts(&message.mp, &mut leaves);
+        let body = leaves.into_iter().find(|p| p.body && p.ct == "text/plain").map(|p| p.content);
         assert_eq!(body, None);
+    }
+
+    #[test]
+    fn collect_leaf_parts_finds_body_nested_inside_multipart_alternative() {
+        // Shape matches a real multipart/alternative message, captured
+        // live: the plain-text body is nested one level under "1".
+        let raw = r#"{
+            "Body": {
+                "GetMsgResponse": {
+                    "m": [{
+                        "mp": [{
+                            "part": "1",
+                            "ct": "multipart/alternative",
+                            "mp": [
+                                {"part": "1.1", "ct": "text/plain", "body": true, "content": "Plain fallback text"},
+                                {"part": "1.2", "ct": "text/html", "content": "<p>HTML</p>"}
+                            ]
+                        }]
+                    }]
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<GetMsgBody> = serde_json::from_str(raw).unwrap();
+        let message = envelope.body.get_msg_response.unwrap().m.into_iter().next().unwrap();
+        let mut leaves = Vec::new();
+        collect_leaf_parts(&message.mp, &mut leaves);
+        let body = leaves.into_iter().find(|p| p.body && p.ct == "text/plain").map(|p| p.content);
+        assert_eq!(body, Some("Plain fallback text".to_string()));
+    }
+
+    #[test]
+    fn collect_attachments_finds_a_nested_attachment_part() {
+        // Shape matches our own live multipart/mixed + alternative +
+        // attachment test message (id 282).
+        let raw = r#"{
+            "Body": {
+                "GetMsgResponse": {
+                    "m": [{
+                        "mp": [{
+                            "part": "TEXT",
+                            "ct": "multipart/mixed",
+                            "mp": [
+                                {
+                                    "part": "1",
+                                    "ct": "multipart/alternative",
+                                    "mp": [
+                                        {"part": "1.1", "ct": "text/plain", "body": true, "content": "Plain"},
+                                        {"part": "1.2", "ct": "text/html"}
+                                    ]
+                                },
+                                {
+                                    "part": "2",
+                                    "ct": "text/plain",
+                                    "cd": "attachment",
+                                    "filename": "rust-note.txt",
+                                    "s": 25
+                                }
+                            ]
+                        }]
+                    }]
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<GetMsgBody> = serde_json::from_str(raw).unwrap();
+        let message = envelope.body.get_msg_response.unwrap().m.into_iter().next().unwrap();
+        let mut attachments = Vec::new();
+        collect_attachments(&message.mp, &mut attachments);
+        assert_eq!(
+            attachments,
+            vec![AttachmentRef {
+                part_id: "2".into(),
+                filename: "rust-note.txt".into(),
+                content_type: "text/plain".into(),
+                size: 25,
+            }]
+        );
     }
 
     #[test]
