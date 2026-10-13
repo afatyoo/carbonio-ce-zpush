@@ -11,6 +11,34 @@ pub struct CarbonioClient {
     auth_token: Option<String>,
 }
 
+/// An email to send via [`CarbonioClient::send_message`]. `attachment_aids`
+/// are upload ids obtained from [`CarbonioClient::upload_attachment`].
+#[derive(Debug, Clone, Default)]
+pub struct OutgoingMessage {
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub subject: String,
+    pub plain_body: String,
+    pub html_body: Option<String>,
+    pub attachment_aids: Vec<String>,
+}
+
+/// Parses Carbonio's `/service/upload` REST response: a bare line shaped
+/// like `200,'null','<aid>'` (status code, a quoted ignorable field, and
+/// the quoted attachment id).
+fn parse_upload_response(text: &str) -> Result<String> {
+    let text = text.trim();
+    let status_end = text.find(',').context("upload response missing status code")?;
+    let status: u16 = text[..status_end].parse().context("upload response had a non-numeric status code")?;
+    if status != 200 {
+        bail!("attachment upload returned status {status}: {text}");
+    }
+    let aid_start = text.rfind('\'').context("upload response missing closing quote for aid")?;
+    let before_aid = &text[..aid_start];
+    let aid_quote_start = before_aid.rfind('\'').context("upload response missing opening quote for aid")?;
+    Ok(text[aid_quote_start + 1..aid_start].to_string())
+}
+
 #[derive(Debug, Deserialize)]
 struct SoapEnvelope<T> {
     #[serde(rename = "Body")]
@@ -391,27 +419,44 @@ impl CarbonioClient {
     /// Sends a plain-text email via `SendMsgRequest` (`urn:zimbraMail`).
     /// Does not support HTML bodies or attachments yet; `to`/`cc` are the
     /// raw address strings as parsed from the device's RFC 822 headers.
-    pub async fn send_message(&self, to: &[String], cc: &[String], subject: &str, body: &str) -> Result<()> {
+    pub async fn send_message(&self, msg: &OutgoingMessage) -> Result<()> {
         let token = self
             .auth_token
             .as_deref()
             .context("send_message called before authenticate")?;
 
-        let mut participants: Vec<_> = to.iter().map(|addr| json!({ "t": "t", "a": addr })).collect();
-        participants.extend(cc.iter().map(|addr| json!({ "t": "c", "a": addr })));
+        let mut participants: Vec<_> = msg.to.iter().map(|addr| json!({ "t": "t", "a": addr })).collect();
+        participants.extend(msg.cc.iter().map(|addr| json!({ "t": "c", "a": addr })));
+
+        // An HTML body and a plain-text body are sent as sibling
+        // multipart/alternative parts when both are present (matches what
+        // a real mail client sends); plain-text-only stays a single part.
+        let mp = if let Some(html) = &msg.html_body {
+            json!({
+                "ct": "multipart/alternative",
+                "mp": [
+                    { "ct": "text/plain", "content": { "_content": msg.plain_body } },
+                    { "ct": "text/html", "content": { "_content": html } }
+                ]
+            })
+        } else {
+            json!({ "ct": "text/plain", "content": { "_content": msg.plain_body } })
+        };
+
+        let mut m = json!({
+            "su": { "_content": msg.subject },
+            "e": participants,
+            "mp": mp
+        });
+        if !msg.attachment_aids.is_empty() {
+            m["attach"] = json!({ "aid": msg.attachment_aids.join(",") });
+        }
 
         let request_body = json!({
             "Body": {
                 "SendMsgRequest": {
                     "_jsns": "urn:zimbraMail",
-                    "m": {
-                        "su": { "_content": subject },
-                        "e": participants,
-                        "mp": {
-                            "ct": "text/plain",
-                            "content": { "_content": body }
-                        }
-                    }
+                    "m": m
                 }
             },
             "Header": {
@@ -445,6 +490,39 @@ impl CarbonioClient {
         }
 
         Ok(())
+    }
+
+    /// Uploads `data` via the REST `/service/upload` endpoint (not SOAP;
+    /// Carbonio's attachment upload is multipart/form-data over REST) and
+    /// returns the resulting attachment id (`aid`), to reference from
+    /// [`Self::send_message`]'s `attachment_aids`. Carbonio does not accept
+    /// attachment bytes inlined directly in `SendMsgRequest`'s `mp` tree:
+    /// doing that was tried live and silently became a second body part
+    /// instead of a real downloadable attachment.
+    pub async fn upload_attachment(&self, filename: &str, content_type: &str, data: Vec<u8>) -> Result<String> {
+        let token = self.auth_token.as_deref().context("upload_attachment called before authenticate")?;
+        let upload_url = format!("{}/service/upload?fmt=raw", self.base_url.trim_end_matches('/'));
+
+        let part = reqwest::multipart::Part::bytes(data)
+            .file_name(filename.to_string())
+            .mime_str(content_type)
+            .context("invalid attachment content type")?;
+        let form = reqwest::multipart::Form::new().part("upload", part);
+
+        let response = self
+            .http
+            .post(&upload_url)
+            .header("Cookie", format!("ZM_AUTH_TOKEN={token}"))
+            .multipart(form)
+            .send()
+            .await
+            .context("attachment upload failed to reach Carbonio")?;
+
+        let text = response.text().await.context("attachment upload response was not readable")?;
+        // Response is a bare comma-separated line: `200,'null','<aid>'`
+        // (not JSON, not SOAP) -- the one REST, non-SOAP call this client
+        // makes, because Carbonio's attachment upload only exists as REST.
+        parse_upload_response(&text)
     }
 
     /// Lists up to `limit` contacts in `folder_id`, via `SearchRequest`
@@ -1318,6 +1396,21 @@ mod tests {
         let message = envelope.body.get_msg_response.unwrap().m.into_iter().next().unwrap();
         let body = message.mp.into_iter().find(|p| p.body && p.ct == "text/plain").map(|p| p.content);
         assert_eq!(body, None);
+    }
+
+    #[test]
+    fn parses_a_real_upload_response() {
+        // Captured live from Carbonio CE 4.5.14's /service/upload?fmt=raw.
+        let raw = "200,'null','c6d61b68-cd2d-420a-bb0f-ff6edd48db7c:5824e249-83f0-4b7e-8b5a-3f155b64ee55'";
+        let aid = parse_upload_response(raw).unwrap();
+        assert_eq!(aid, "c6d61b68-cd2d-420a-bb0f-ff6edd48db7c:5824e249-83f0-4b7e-8b5a-3f155b64ee55");
+    }
+
+    #[test]
+    fn upload_response_with_non_200_status_is_an_error() {
+        let raw = "500,'null','error'";
+        let err = parse_upload_response(raw).unwrap_err();
+        assert!(err.to_string().contains("status 500"));
     }
 
     #[test]

@@ -28,7 +28,7 @@ Early, working foundation, not yet feature-complete. Verified end-to-end against
 Email, Contacts, and Calendar cover every item type this Carbonio CE instance actually has. Tasks is not implemented, and isn't tracked as a gap: this Carbonio CE build has no Tasks folder at all, and rejects `SearchRequest types=task` outright with `invalid item type: task`. Tasks appears to be a Carbonio Advanced (paid) feature, not something missing from this rewrite.
 
 - [x] `ItemOperations`/`Fetch` for email: fetches a message's plain-text body via `GetMsgRequest` and returns it under `Properties/Body`. Verified end-to-end: fetched a real message and got back its exact original body text. No attachment download, and no Fetch for Contacts/Calendar items. Same WBXML-token caveat as `GetItemEstimate`
-- [ ] HTML bodies and attachments in `SendMail` (multipart/MIME parsing)
+- [x] HTML bodies and attachments in `SendMail`: `src/mime_lite.rs` now parses multipart MIME (nested `multipart/alternative`/`multipart/mixed`, quoted-printable and base64 decoding) instead of just a flat header/body split. Attachments are uploaded via Carbonio's REST `/service/upload` endpoint (not SOAP) and referenced by `aid` in `SendMsgRequest`; inlining attachment bytes directly in the SOAP `mp` tree was tried live and silently became a second body part instead of a real downloadable attachment, which is how this gap was found. Verified end-to-end: sent a message with an HTML part and a text attachment, both landed correctly (`cd: "attachment"`, real `filename`, no stray body part)
 - [ ] Real push: `Ping` needs a Carbonio-side change notification to actually block until new mail arrives
 - [ ] FolderSync's own SyncKey is still hardcoded to "1" on every call, unlike the per-collection Sync command, which now tracks a real key
 
@@ -80,7 +80,7 @@ scp root@<carbonio-host>:/opt/zextras/ssl/carbonio/server/server.crt rust/certs/
 | `src/wbxml.rs` | WBXML binary codec (encode/decode), codepage-table driven |
 | `src/codepages.rs` | WBXML codepage token tables (AirSync, Email, Contacts, Calendar, FolderHierarchy, ItemEstimate, ItemOperations, Ping, Provision) and Carbonio→ActiveSync folder type mapping |
 | `src/sync_state.rs` | SyncKey store, per (user, device, collection), with optional JSON-file persistence |
-| `src/mime_lite.rs` | Minimal RFC 822 header/body parser for `SendMail` bodies |
+| `src/mime_lite.rs` | RFC 822 + MIME multipart parser for `SendMail` bodies (plain/HTML/attachments) |
 | `src/activesync_http.rs` | ActiveSync HTTP framing: Basic Auth header, `Cmd`/`User`/`DeviceId`/`DeviceType` query parsing |
 | `src/server.rs` | `axum` HTTP server, command dispatch (`FolderSync`, `Sync`, `Provision`, `Ping`, `SendMail`, `GetItemEstimate`, `ItemOperations`) |
 

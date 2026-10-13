@@ -684,7 +684,30 @@ async fn handle_send_mail(client: &CarbonioClient, body: &[u8]) -> Response {
         return (StatusCode::BAD_REQUEST, "SendMail body had no To recipients").into_response();
     }
 
-    match client.send_message(&parsed.to, &parsed.cc, &parsed.subject, &parsed.body).await {
+    let mut attachment_aids = Vec::with_capacity(parsed.attachments.len());
+    for attachment in &parsed.attachments {
+        match client.upload_attachment(&attachment.filename, &attachment.content_type, attachment.data.clone()).await {
+            Ok(aid) => attachment_aids.push(aid),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("uploading attachment '{}' to Carbonio failed: {e}", attachment.filename),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    let outgoing = crate::carbonio::OutgoingMessage {
+        to: parsed.to,
+        cc: parsed.cc,
+        subject: parsed.subject,
+        plain_body: parsed.plain_body,
+        html_body: parsed.html_body,
+        attachment_aids,
+    };
+
+    match client.send_message(&outgoing).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, format!("SendMsgRequest to Carbonio failed: {e}")).into_response(),
     }
