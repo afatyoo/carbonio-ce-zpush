@@ -2,7 +2,7 @@
 
 ActiveSync (Exchange protocol) connector for **Zextras Carbonio CE**, being rewritten from the original PHP z-push + Zimbra backend into a standalone **Rust** server, dropping the PHP runtime dependency entirely.
 
-Forked from [imanudin11/zimbra-zpush](https://github.com/imanudin11/zimbra-zpush) (PHP z-push with a Zimbra backend). The original PHP code is kept in the repo root for reference while the Rust rewrite (`rust/`) replaces it piece by piece.
+Forked from [imanudin11/zimbra-zpush](https://github.com/imanudin11/zimbra-zpush) (PHP z-push with a Zimbra backend). All the original PHP code has been removed from this repo; everything here is the Rust rewrite (`rust/`). The PHP source is still available in the upstream repo if it's needed as a reference while porting a command this rewrite doesn't cover yet.
 
 ## Status
 
