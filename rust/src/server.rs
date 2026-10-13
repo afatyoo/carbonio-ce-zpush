@@ -1,9 +1,10 @@
 use crate::activesync_http::{ensure_supported_command, parse_activesync_query, parse_basic_auth, ActiveSyncRequest};
 use crate::carbonio::CarbonioClient;
 use crate::codepages::{
-    activesync_folder_type, airsync_encode_table, airsync_item_page_of, contacts_encode_table,
-    email_encode_table, folderhierarchy_encode_table, merge_encode_tables, ping_encode_table,
-    provision_encode_table, PAGE_CONTACTS, PAGE_EMAIL, PAGE_FOLDERHIERARCHY, PAGE_PING, PAGE_PROVISION,
+    activesync_folder_type, airsync_encode_table, airsync_item_page_of, calendar_encode_table,
+    contacts_encode_table, email_encode_table, folderhierarchy_encode_table, merge_encode_tables,
+    ping_encode_table, provision_encode_table, PAGE_CALENDAR, PAGE_CONTACTS, PAGE_EMAIL,
+    PAGE_FOLDERHIERARCHY, PAGE_PING, PAGE_PROVISION,
 };
 use crate::mime_lite::parse_rfc822;
 use crate::sync_state::SyncStateStore;
@@ -218,14 +219,25 @@ async fn handle_folder_sync(client: &mut CarbonioClient) -> Response {
 enum CollectionKind {
     Email,
     Contacts,
+    Calendar,
 }
 
 fn collection_kind_for_view(view: Option<&str>) -> Option<CollectionKind> {
     match view {
         Some("contact") => Some(CollectionKind::Contacts),
+        Some("appointment") => Some(CollectionKind::Calendar),
         Some("message") | None => Some(CollectionKind::Email),
         Some(_) => None,
     }
+}
+
+/// Formats a Unix epoch (milliseconds) as the compact UTC datetime string
+/// ActiveSync uses for `StartTime`/`EndTime` (MS-ASCAL 2.2.2.1): "no dashes,
+/// no colons, trailing Z", e.g. `20261020T160000Z`.
+fn format_activesync_datetime(epoch_ms: i64) -> String {
+    use chrono::{DateTime, Utc};
+    let dt: DateTime<Utc> = DateTime::from_timestamp_millis(epoch_ms).unwrap_or_default();
+    dt.format("%Y%m%dT%H%M%SZ").to_string()
 }
 
 async fn handle_sync(
@@ -273,6 +285,10 @@ async fn handle_sync(
             CollectionKind::Contacts => match client.search_contacts(&collection_id, 100).await {
                 Ok(contacts) => contacts.iter().map(contact_to_add_node).collect(),
                 Err(e) => return (StatusCode::BAD_GATEWAY, format!("SearchRequest (contacts) from Carbonio failed: {e}")).into_response(),
+            },
+            CollectionKind::Calendar => match client.search_appointments(&collection_id, 50).await {
+                Ok(appts) => appts.iter().map(appointment_to_add_node).collect(),
+                Err(e) => return (StatusCode::BAD_GATEWAY, format!("SearchRequest (appointments) from Carbonio failed: {e}")).into_response(),
             },
         };
         let new_key = sync_state.advance_key(&request.user, &request.device_id, &collection_id);
@@ -348,6 +364,43 @@ fn contact_to_add_node(c: &crate::carbonio::CarbonioContact) -> WbxmlNode {
     }
 }
 
+fn appointment_to_add_node(a: &crate::carbonio::CarbonioAppointment) -> WbxmlNode {
+    WbxmlNode::Tag {
+        name: "Add".into(),
+        children: vec![
+            WbxmlNode::Tag {
+                name: "ServerId".into(),
+                children: vec![WbxmlNode::Text(a.id.clone())],
+            },
+            WbxmlNode::Tag {
+                name: "ApplicationData".into(),
+                children: vec![
+                    WbxmlNode::Tag {
+                        name: "Subject".into(),
+                        children: vec![WbxmlNode::Text(a.subject.clone())],
+                    },
+                    WbxmlNode::Tag {
+                        name: "Location".into(),
+                        children: vec![WbxmlNode::Text(a.location.clone())],
+                    },
+                    WbxmlNode::Tag {
+                        name: "StartTime".into(),
+                        children: vec![WbxmlNode::Text(format_activesync_datetime(a.start_epoch_ms))],
+                    },
+                    WbxmlNode::Tag {
+                        name: "EndTime".into(),
+                        children: vec![WbxmlNode::Text(format_activesync_datetime(a.end_epoch_ms))],
+                    },
+                    WbxmlNode::Tag {
+                        name: "AllDayEvent".into(),
+                        children: vec![WbxmlNode::Text(if a.all_day { "1" } else { "0" }.into())],
+                    },
+                ],
+            },
+        ],
+    }
+}
+
 fn build_sync_response(
     collection_id: &str,
     status: &str,
@@ -358,6 +411,7 @@ fn build_sync_response(
     let (class_name, item_page, item_encode_table) = match kind {
         CollectionKind::Email => ("Email", PAGE_EMAIL, email_encode_table()),
         CollectionKind::Contacts => ("Contacts", PAGE_CONTACTS, contacts_encode_table()),
+        CollectionKind::Calendar => ("Calendar", PAGE_CALENDAR, calendar_encode_table()),
     };
 
     let mut collection_children = vec![

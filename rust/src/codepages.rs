@@ -6,6 +6,7 @@ use std::collections::HashMap;
 pub const PAGE_AIRSYNC: u8 = 0x00;
 pub const PAGE_CONTACTS: u8 = 0x01;
 pub const PAGE_EMAIL: u8 = 0x02;
+pub const PAGE_CALENDAR: u8 = 0x04;
 pub const PAGE_FOLDERHIERARCHY: u8 = 0x07;
 pub const PAGE_PING: u8 = 0x0D;
 pub const PAGE_PROVISION: u8 = 0x0E;
@@ -47,6 +48,16 @@ const CONTACTS_TAGS: &[(u8, &str)] = &[
     (0x1F, "FirstName"),
     (0x29, "LastName"),
     (0x2B, "MobilePhoneNumber"),
+];
+
+/// Calendar (codepage 4) tags, [MS-ASWBXML] 2.1.2.4. Minimal field set: no
+/// attendees, recurrence, or reminders.
+const CALENDAR_TAGS: &[(u8, &str)] = &[
+    (0x06, "AllDayEvent"),
+    (0x12, "EndTime"),
+    (0x17, "Location"),
+    (0x26, "Subject"),
+    (0x27, "StartTime"),
 ];
 
 /// Email (codepage 2) tags, [MS-ASWBXML] 2.1.2.3. Minimal field set for a
@@ -196,6 +207,12 @@ pub fn contacts_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
 pub fn contacts_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
     build_encode_table(PAGE_CONTACTS, CONTACTS_TAGS)
 }
+pub fn calendar_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
+    build_decode_table(PAGE_CALENDAR, CALENDAR_TAGS)
+}
+pub fn calendar_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
+    build_encode_table(PAGE_CALENDAR, CALENDAR_TAGS)
+}
 pub fn folderhierarchy_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
     build_decode_table(PAGE_FOLDERHIERARCHY, FOLDERHIERARCHY_TAGS)
 }
@@ -258,6 +275,7 @@ mod tests {
             (airsync_decode_table(), airsync_encode_table()),
             (email_decode_table(), email_encode_table()),
             (contacts_decode_table(), contacts_encode_table()),
+            (calendar_decode_table(), calendar_encode_table()),
             (folderhierarchy_decode_table(), folderhierarchy_encode_table()),
             (ping_decode_table(), ping_encode_table()),
             (provision_decode_table(), provision_encode_table()),

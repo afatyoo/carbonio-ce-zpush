@@ -500,12 +500,133 @@ impl CarbonioClient {
 
         Ok(raw_contacts.into_iter().map(RawContact::into_carbonio_contact).collect())
     }
+
+    /// Lists up to `limit` calendar events in `folder_id`, via
+    /// `SearchRequest` (`urn:zimbraMail`) with `types=appointment`. Only
+    /// the first occurrence (`inst[0]`) of a recurring event is used;
+    /// recurrence rules themselves are not synced (a recurring event shows
+    /// up as a single one-off event on the first occurrence's date).
+    pub async fn search_appointments(&self, folder_id: &str, limit: u32) -> Result<Vec<CarbonioAppointment>> {
+        let token = self
+            .auth_token
+            .as_deref()
+            .context("search_appointments called before authenticate")?;
+
+        let request_body = json!({
+            "Body": {
+                "SearchRequest": {
+                    "_jsns": "urn:zimbraMail",
+                    "types": "appointment",
+                    "query": { "_content": format!("inid:{folder_id}") },
+                    "limit": limit
+                }
+            },
+            "Header": {
+                "context": {
+                    "_jsns": "urn:zimbra",
+                    "authToken": { "_content": token }
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("SearchRequest (appointments) failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<SearchApptBody> = response
+            .json()
+            .await
+            .context("SearchRequest (appointments) response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault
+                .detail
+                .map(|d| d.error.code)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio SearchRequest (appointments) failed ({code}): {}", fault.reason.text);
+        }
+
+        let raw_appts = envelope
+            .body
+            .search_response
+            .context("SearchResponse missing from a non-fault SOAP reply")?
+            .appt;
+
+        Ok(raw_appts.into_iter().map(RawAppointment::into_carbonio_appointment).collect())
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct SendMsgBody {
     #[serde(rename = "Fault")]
     fault: Option<SoapFault>,
+}
+
+/// One calendar event, trimmed to the fields the Calendar codepage
+/// currently emits. Does not carry attendees, recurrence, or reminders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarbonioAppointment {
+    pub id: String,
+    pub subject: String,
+    pub location: String,
+    pub start_epoch_ms: i64,
+    pub end_epoch_ms: i64,
+    pub all_day: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchApptBody {
+    #[serde(rename = "SearchResponse")]
+    search_response: Option<SearchApptResponse>,
+    #[serde(rename = "Fault")]
+    fault: Option<SoapFault>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchApptResponse {
+    #[serde(default)]
+    appt: Vec<RawAppointment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAppointment {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    loc: String,
+    /// Duration in milliseconds.
+    #[serde(default)]
+    dur: i64,
+    #[serde(default, rename = "allDay")]
+    all_day: bool,
+    #[serde(default)]
+    inst: Vec<RawInstance>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawInstance {
+    /// Occurrence start time, milliseconds since the Unix epoch.
+    s: i64,
+}
+
+impl RawAppointment {
+    fn into_carbonio_appointment(self) -> CarbonioAppointment {
+        let start_epoch_ms = self.inst.first().map(|i| i.s).unwrap_or(0);
+        CarbonioAppointment {
+            id: self.id,
+            subject: self.name,
+            location: self.loc,
+            start_epoch_ms,
+            end_epoch_ms: start_epoch_ms + self.dur,
+            all_day: self.all_day,
+        }
+    }
 }
 
 /// One contact, trimmed to the fields the Contacts codepage currently emits.
@@ -809,5 +930,60 @@ mod tests {
         let contacts: Vec<CarbonioContact> =
             raw_contacts.into_iter().map(RawContact::into_carbonio_contact).collect();
         assert_eq!(contacts[0].first_name, "");
+    }
+
+    #[test]
+    fn search_appointments_response_maps_subject_location_and_computes_end_time() {
+        // Shape matches a real CreateAppointmentRequest/SearchRequest hit,
+        // captured live from Carbonio CE 4.5.14: a 1-hour meeting starting
+        // at inst[0].s with duration `dur` in milliseconds.
+        let raw = r#"{
+            "Body": {
+                "SearchResponse": {
+                    "appt": [{
+                        "id": "264",
+                        "name": "Team Sync Meeting",
+                        "loc": "Zoom",
+                        "dur": 3600000,
+                        "allDay": false,
+                        "inst": [{"s": 1792512000000}]
+                    }]
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+
+        let envelope: SoapEnvelope<SearchApptBody> = serde_json::from_str(raw).unwrap();
+        let raw_appts = envelope.body.search_response.unwrap().appt;
+        let appointments: Vec<CarbonioAppointment> =
+            raw_appts.into_iter().map(RawAppointment::into_carbonio_appointment).collect();
+
+        assert_eq!(
+            appointments,
+            vec![CarbonioAppointment {
+                id: "264".into(),
+                subject: "Team Sync Meeting".into(),
+                location: "Zoom".into(),
+                start_epoch_ms: 1792512000000,
+                end_epoch_ms: 1792515600000,
+                all_day: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn appointment_with_no_instances_defaults_start_to_zero() {
+        let raw = r#"{
+            "Body": {
+                "SearchResponse": { "appt": [{"id": "1", "name": "X", "dur": 1000}] }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<SearchApptBody> = serde_json::from_str(raw).unwrap();
+        let raw_appts = envelope.body.search_response.unwrap().appt;
+        let appointments: Vec<CarbonioAppointment> =
+            raw_appts.into_iter().map(RawAppointment::into_carbonio_appointment).collect();
+        assert_eq!(appointments[0].start_epoch_ms, 0);
+        assert_eq!(appointments[0].end_epoch_ms, 1000);
     }
 }
