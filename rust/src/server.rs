@@ -3,9 +3,9 @@ use crate::carbonio::CarbonioClient;
 use crate::codepages::{
     activesync_folder_type, airsync_encode_table, airsync_item_page_of, calendar_encode_table,
     contacts_encode_table, email_encode_table, folderhierarchy_encode_table, itemestimate_decode_table,
-    itemestimate_encode_table, merge_encode_tables, ping_encode_table, provision_encode_table,
-    PAGE_CALENDAR, PAGE_CONTACTS, PAGE_EMAIL, PAGE_FOLDERHIERARCHY, PAGE_ITEMESTIMATE, PAGE_PING,
-    PAGE_PROVISION,
+    itemestimate_encode_table, itemoperations_decode_table, itemoperations_encode_table,
+    merge_encode_tables, ping_encode_table, provision_encode_table, PAGE_CALENDAR, PAGE_CONTACTS,
+    PAGE_EMAIL, PAGE_FOLDERHIERARCHY, PAGE_ITEMESTIMATE, PAGE_ITEMOPERATIONS, PAGE_PING, PAGE_PROVISION,
 };
 use crate::mime_lite::parse_rfc822;
 use crate::sync_state::SyncStateStore;
@@ -121,6 +121,7 @@ async fn handle_activesync(
         "Ping" => handle_ping(),
         "SendMail" => handle_send_mail(&client, &body).await,
         "GetItemEstimate" => handle_get_item_estimate(&client, &body).await,
+        "ItemOperations" => handle_item_operations(&client, &body).await,
         other => (
             StatusCode::NOT_IMPLEMENTED,
             format!("'{other}' is accepted but not yet wired to a Carbonio handler"),
@@ -576,6 +577,70 @@ async fn handle_get_item_estimate(client: &CarbonioClient, body: &[u8]) -> Respo
 
     let encode_table = itemestimate_encode_table();
     let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &|_name| PAGE_ITEMESTIMATE) {
+        Ok(bytes) => bytes,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
+    };
+    (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
+}
+
+/// Handles `ItemOperations`/`Fetch` for an email message: fetches the
+/// plain-text body via `GetMsgRequest` and returns it under `Properties`.
+/// Only email Fetch is implemented (no attachment download, no
+/// Contacts/Calendar Fetch). WBXML token values for this command's
+/// codepage are unverified against a real device, same caveat as
+/// `GetItemEstimate` -- see `codepages::ITEMOPERATIONS_TAGS`.
+async fn handle_item_operations(client: &CarbonioClient, body: &[u8]) -> Response {
+    let decode_table = itemoperations_decode_table();
+    let nodes = match WbxmlDecoder::new(body, &decode_table).decode() {
+        Ok(n) => n,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("failed to decode ItemOperations body: {e}")).into_response(),
+    };
+    let server_id = match find_text_child(&nodes, "ServerId") {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, "ItemOperations Fetch missing ServerId").into_response(),
+    };
+
+    let message_body = match client.get_message_body(&server_id).await {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("GetMsg from Carbonio failed: {e}")).into_response(),
+    };
+
+    let tree = vec![WbxmlNode::Tag {
+        name: "ItemOperations".into(),
+        children: vec![
+            WbxmlNode::Tag {
+                name: "Status".into(),
+                children: vec![WbxmlNode::Text("1".into())],
+            },
+            WbxmlNode::Tag {
+                name: "Response".into(),
+                children: vec![WbxmlNode::Tag {
+                    name: "Fetch".into(),
+                    children: vec![
+                        WbxmlNode::Tag {
+                            name: "Status".into(),
+                            children: vec![WbxmlNode::Text("1".into())],
+                        },
+                        WbxmlNode::Tag {
+                            name: "ServerId".into(),
+                            children: vec![WbxmlNode::Text(server_id)],
+                        },
+                        WbxmlNode::Tag {
+                            name: "Properties".into(),
+                            children: vec![WbxmlNode::Tag {
+                                name: "Body".into(),
+                                children: vec![WbxmlNode::Text(message_body)],
+                            }],
+                        },
+                    ],
+                }],
+            },
+        ],
+    }];
+
+    let encode_table = merge_encode_tables(vec![itemoperations_encode_table(), email_encode_table()]);
+    let page_of = |name: &str| if name == "Body" { PAGE_EMAIL } else { PAGE_ITEMOPERATIONS };
+    let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &page_of) {
         Ok(bytes) => bytes,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
     };

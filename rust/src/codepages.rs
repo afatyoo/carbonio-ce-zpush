@@ -11,6 +11,7 @@ pub const PAGE_FOLDERHIERARCHY: u8 = 0x07;
 pub const PAGE_ITEMESTIMATE: u8 = 0x06;
 pub const PAGE_PING: u8 = 0x0D;
 pub const PAGE_PROVISION: u8 = 0x0E;
+pub const PAGE_ITEMOPERATIONS: u8 = 0x14;
 
 /// AirSync (codepage 0) tags, [MS-ASWBXML] 2.1.2.1. Only the subset this
 /// server currently emits/consumes for FolderSync and item Sync.
@@ -64,6 +65,10 @@ const CALENDAR_TAGS: &[(u8, &str)] = &[
 /// Email (codepage 2) tags, [MS-ASWBXML] 2.1.2.3. Minimal field set for a
 /// readable message list (no attachments/MIME/meeting-request fields yet).
 const EMAIL_TAGS: &[(u8, &str)] = &[
+    // Deprecated in EAS 14.0+ (modern clients expect Body under the
+    // AirSyncBase codepage instead, which this project doesn't model yet);
+    // kept here as the simplest way to carry Fetch's body text for now.
+    (0x0C, "Body"),
     (0x0F, "DateReceived"),
     (0x11, "DisplayTo"),
     (0x12, "Importance"),
@@ -141,6 +146,26 @@ const PROVISION_TAGS: &[(u8, &str)] = &[
     (0x0B, "Status"),
     (0x0C, "RemoteWipe"),
     (0x0E, "DeviceInformation"),
+];
+
+/// ItemOperations (codepage 20) tags, [MS-ASWBXML] 2.1.2.20. NOTE: like
+/// `ITEMESTIMATE_TAGS`, these token values are reproduced from memory and
+/// not re-checked against the published spec text or a real device.
+/// `ServerId`/`CollectionId` for a Fetch target come from the AirSync
+/// codepage (0), not this one.
+const ITEMOPERATIONS_TAGS: &[(u8, &str)] = &[
+    (0x05, "ItemOperations"),
+    (0x06, "Fetch"),
+    (0x07, "Store"),
+    (0x08, "Options"),
+    (0x0B, "Properties"),
+    (0x0D, "Status"),
+    (0x0E, "Response"),
+    // Not part of the official ItemOperations codepage (the spec reuses
+    // AirSync's tokens for these); kept self-contained here instead, same
+    // simplification already used for ITEMESTIMATE_TAGS's own CollectionId.
+    (0x10, "ServerId"),
+    (0x11, "CollectionId"),
 ];
 
 /// ActiveSync folder type codes (MS-ASCMD 2.2.3.165.1) for the Carbonio/Zimbra
@@ -244,6 +269,12 @@ pub fn itemestimate_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
 pub fn itemestimate_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
     build_encode_table(PAGE_ITEMESTIMATE, ITEMESTIMATE_TAGS)
 }
+pub fn itemoperations_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
+    build_decode_table(PAGE_ITEMOPERATIONS, ITEMOPERATIONS_TAGS)
+}
+pub fn itemoperations_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
+    build_encode_table(PAGE_ITEMOPERATIONS, ITEMOPERATIONS_TAGS)
+}
 pub fn ping_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
     build_decode_table(PAGE_PING, PING_TAGS)
 }
@@ -303,6 +334,7 @@ mod tests {
             (calendar_decode_table(), calendar_encode_table()),
             (folderhierarchy_decode_table(), folderhierarchy_encode_table()),
             (itemestimate_decode_table(), itemestimate_encode_table()),
+            (itemoperations_decode_table(), itemoperations_encode_table()),
             (ping_decode_table(), ping_encode_table()),
             (provision_decode_table(), provision_encode_table()),
         ] {

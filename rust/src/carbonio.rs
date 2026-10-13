@@ -564,6 +564,99 @@ impl CarbonioClient {
 
         Ok(raw_appts.into_iter().map(RawAppointment::into_carbonio_appointment).collect())
     }
+
+    /// Fetches a message's plain-text body via `GetMsgRequest`
+    /// (`urn:zimbraMail`). Returns the first MIME part marked `body: true`
+    /// with a `text/plain` content type; HTML-only messages and messages
+    /// with no plain-text part return an empty string rather than an error.
+    pub async fn get_message_body(&self, message_id: &str) -> Result<String> {
+        let token = self
+            .auth_token
+            .as_deref()
+            .context("get_message_body called before authenticate")?;
+
+        let request_body = json!({
+            "Body": {
+                "GetMsgRequest": {
+                    "_jsns": "urn:zimbraMail",
+                    "m": { "id": message_id }
+                }
+            },
+            "Header": {
+                "context": {
+                    "_jsns": "urn:zimbra",
+                    "authToken": { "_content": token }
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("GetMsgRequest failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<GetMsgBody> = response
+            .json()
+            .await
+            .context("GetMsgRequest response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault
+                .detail
+                .map(|d| d.error.code)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio GetMsgRequest failed ({code}): {}", fault.reason.text);
+        }
+
+        let message = envelope
+            .body
+            .get_msg_response
+            .context("GetMsgResponse missing from a non-fault SOAP reply")?
+            .m
+            .into_iter()
+            .next()
+            .context("GetMsgResponse had no message")?;
+
+        Ok(message
+            .mp
+            .into_iter()
+            .find(|part| part.body && part.ct == "text/plain")
+            .map(|part| part.content)
+            .unwrap_or_default())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GetMsgBody {
+    #[serde(rename = "GetMsgResponse")]
+    get_msg_response: Option<GetMsgResponse>,
+    #[serde(rename = "Fault")]
+    fault: Option<SoapFault>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetMsgResponse {
+    #[serde(default)]
+    m: Vec<RawFullMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFullMessage {
+    #[serde(default)]
+    mp: Vec<RawMimePart>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMimePart {
+    ct: String,
+    #[serde(default)]
+    body: bool,
+    #[serde(default)]
+    content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -994,5 +1087,46 @@ mod tests {
             raw_appts.into_iter().map(RawAppointment::into_carbonio_appointment).collect();
         assert_eq!(appointments[0].start_epoch_ms, 0);
         assert_eq!(appointments[0].end_epoch_ms, 1000);
+    }
+
+    #[test]
+    fn get_msg_response_extracts_the_plain_text_body_part() {
+        // Shape matches a real GetMsgRequest hit, captured live from
+        // Carbonio CE 4.5.14 for a plain-text message.
+        let raw = r#"{
+            "Body": {
+                "GetMsgResponse": {
+                    "m": [{
+                        "mp": [{
+                            "part": "1",
+                            "ct": "text/plain",
+                            "body": true,
+                            "content": "Hello body text"
+                        }]
+                    }]
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<GetMsgBody> = serde_json::from_str(raw).unwrap();
+        let message = envelope.body.get_msg_response.unwrap().m.into_iter().next().unwrap();
+        let body = message.mp.into_iter().find(|p| p.body && p.ct == "text/plain").map(|p| p.content);
+        assert_eq!(body, Some("Hello body text".to_string()));
+    }
+
+    #[test]
+    fn get_msg_response_with_no_plain_text_part_has_no_body() {
+        let raw = r#"{
+            "Body": {
+                "GetMsgResponse": {
+                    "m": [{"mp": [{"part": "1", "ct": "text/html", "body": true, "content": "<p>hi</p>"}]}]
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<GetMsgBody> = serde_json::from_str(raw).unwrap();
+        let message = envelope.body.get_msg_response.unwrap().m.into_iter().next().unwrap();
+        let body = message.mp.into_iter().find(|p| p.body && p.ct == "text/plain").map(|p| p.content);
+        assert_eq!(body, None);
     }
 }
