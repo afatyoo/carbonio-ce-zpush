@@ -118,7 +118,7 @@ async fn handle_activesync(
         "FolderSync" => handle_folder_sync(&mut client).await,
         "Sync" => handle_sync(&mut client, &state.sync_state, &request, &body).await,
         "Provision" => handle_provision(),
-        "Ping" => handle_ping(),
+        "Ping" => handle_ping(&client).await,
         "SendMail" => handle_send_mail(&client, &body).await,
         "GetItemEstimate" => handle_get_item_estimate(&client, &body).await,
         "ItemOperations" => handle_item_operations(&client, &body).await,
@@ -509,12 +509,38 @@ fn handle_provision() -> Response {
 /// watching Carbonio for new mail, so devices will poll in a tight loop
 /// rather than holding a real long connection. Real push support needs a
 /// Carbonio-side notification subscription, not implemented yet.
-fn handle_ping() -> Response {
+/// `Ping` now genuinely blocks on Carbonio's own `WaitSetRequest` instead
+/// of replying instantly. One `WaitSetRequest` call is issued per `Ping`;
+/// Carbonio itself clamps the actual wait to roughly 33 seconds regardless
+/// of the timeout requested (observed live), and Carbonio's own nginx
+/// front end rejects a single call that blocks much past that with a 504,
+/// so this does not loop multiple waits in one HTTP response -- the device
+/// will simply issue another `Ping` immediately after this one returns,
+/// same as it would with any `Ping` implementation once this one's single
+/// wait window elapses.
+///
+/// Status 2 ("changes found") is returned on any detected change without
+/// identifying which folder changed (`Folders`/`Folder` is omitted): the
+/// WaitSet response only reports that the account changed, not which
+/// collection, so this is a real but incomplete signal -- a real device
+/// reading status 2 with no folder list is outside what MS-ASCMD 2.2.3.3
+/// documents, and has not been tested against a real client.
+async fn handle_ping(client: &CarbonioClient) -> Response {
+    let (wait_set_id, seq) = match client.create_waitset().await {
+        Ok(ids) => ids,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("CreateWaitSetRequest to Carbonio failed: {e}")).into_response(),
+    };
+
+    let changed = match client.wait_for_changes(&wait_set_id, &seq, 20).await {
+        Ok((changed, _new_seq)) => changed,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("WaitSetRequest to Carbonio failed: {e}")).into_response(),
+    };
+
     let tree = vec![WbxmlNode::Tag {
         name: "Ping".into(),
         children: vec![WbxmlNode::Tag {
             name: "Status".into(),
-            children: vec![WbxmlNode::Text("1".into())],
+            children: vec![WbxmlNode::Text(if changed { "2" } else { "1" }.into())],
         }],
     }];
 

@@ -628,6 +628,196 @@ impl CarbonioClient {
             .map(|part| part.content)
             .unwrap_or_default())
     }
+
+    /// Fetches the authenticated account's own id via `GetInfoRequest`
+    /// (`urn:zimbraAccount`). Needed to explicitly list the account in a
+    /// WaitSet's `add` list (see [`Self::create_waitset`]).
+    async fn get_account_id(&self) -> Result<String> {
+        let token = self.auth_token.as_deref().context("get_account_id called before authenticate")?;
+
+        let request_body = json!({
+            "Body": { "GetInfoRequest": { "_jsns": "urn:zimbraAccount" } },
+            "Header": {
+                "context": { "_jsns": "urn:zimbra", "authToken": { "_content": token } }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("GetInfoRequest failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<GetInfoBody> = response
+            .json()
+            .await
+            .context("GetInfoRequest response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault.detail.map(|d| d.error.code).unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio GetInfoRequest failed ({code}): {}", fault.reason.text);
+        }
+
+        Ok(envelope.body.get_info_response.context("GetInfoResponse missing")?.id)
+    }
+
+    /// Creates a WaitSet (`CreateWaitSetRequest`, `urn:zimbraMail`) bound to
+    /// the authenticated account's own mailbox (no explicit account `add`
+    /// entry, which requires admin rights; omitting it binds to self).
+    /// Returns the WaitSet id and its starting sequence number.
+    pub async fn create_waitset(&self) -> Result<(String, String)> {
+        let token = self.auth_token.as_deref().context("create_waitset called before authenticate")?;
+
+        // An empty `add` list (binding "implicitly" to the caller's own
+        // mailbox) creates a WaitSet successfully but never actually
+        // reports a change -- verified live: the account's own change
+        // token kept advancing on new mail while this WaitSet's `a` list
+        // stayed empty across repeated calls. The account id must be
+        // listed explicitly in `add.a` for change notifications to fire.
+        let account_id = self.get_account_id().await?;
+
+        let request_body = json!({
+            "Body": {
+                "CreateWaitSetRequest": {
+                    "_jsns": "urn:zimbraMail",
+                    "defTypes": "all",
+                    "add": { "a": [{ "id": account_id, "types": "all" }] }
+                }
+            },
+            "Header": {
+                "context": { "_jsns": "urn:zimbra", "authToken": { "_content": token } }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("CreateWaitSetRequest failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<CreateWaitSetBody> = response
+            .json()
+            .await
+            .context("CreateWaitSetRequest response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault.detail.map(|d| d.error.code).unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio CreateWaitSetRequest failed ({code}): {}", fault.reason.text);
+        }
+
+        let resp = envelope.body.create_wait_set_response.context("CreateWaitSetResponse missing")?;
+        let seq = match resp.seq {
+            serde_json::Value::String(s) => s,
+            serde_json::Value::Number(n) => n.to_string(),
+            other => bail!("CreateWaitSetResponse.seq was neither a string nor a number: {other:?}"),
+        };
+        Ok((resp.wait_set, seq))
+    }
+
+    /// Blocks (per Carbonio's own WaitSet semantics -- it clamps the actual
+    /// wait duration server-side, observed around 33s regardless of the
+    /// `timeout_secs` requested) until a change occurs on the account or
+    /// the server-side timeout elapses. Returns whether any change was
+    /// reported and the sequence number to pass on the next call.
+    ///
+    /// Caution: Carbonio's own reverse proxy (nginx, in front of the SOAP
+    /// endpoint) has its own upstream read timeout, observed to reject
+    /// (`504`) a single HTTP call that blocks much longer than ~33-60s.
+    /// Keep `timeout_secs` well under that, or loop multiple shorter calls
+    /// for a longer overall wait instead of one long one.
+    pub async fn wait_for_changes(&self, wait_set_id: &str, seq: &str, timeout_secs: u32) -> Result<(bool, String)> {
+        let token = self.auth_token.as_deref().context("wait_for_changes called before authenticate")?;
+
+        let request_body = json!({
+            "Body": {
+                "WaitSetRequest": {
+                    "_jsns": "urn:zimbraMail",
+                    "waitSet": wait_set_id,
+                    "seq": seq,
+                    "block": true,
+                    "timeout": timeout_secs
+                }
+            },
+            "Header": {
+                "context": { "_jsns": "urn:zimbra", "authToken": { "_content": token } }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("WaitSetRequest failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<WaitSetBody> = response
+            .json()
+            .await
+            .context("WaitSetRequest response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault.detail.map(|d| d.error.code).unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio WaitSetRequest failed ({code}): {}", fault.reason.text);
+        }
+
+        let resp = envelope.body.wait_set_response.context("WaitSetResponse missing")?;
+        let changed = !resp.a.is_empty();
+        Ok((changed, resp.seq))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GetInfoBody {
+    #[serde(rename = "GetInfoResponse")]
+    get_info_response: Option<GetInfoResponse>,
+    #[serde(rename = "Fault")]
+    fault: Option<SoapFault>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetInfoResponse {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateWaitSetBody {
+    #[serde(rename = "CreateWaitSetResponse")]
+    create_wait_set_response: Option<CreateWaitSetResponse>,
+    #[serde(rename = "Fault")]
+    fault: Option<SoapFault>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateWaitSetResponse {
+    #[serde(rename = "waitSet")]
+    wait_set: String,
+    /// Observed as a bare JSON number (`0`) in practice, unlike
+    /// `WaitSetResponse.seq` which comes back as a string; accept either.
+    seq: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct WaitSetBody {
+    #[serde(rename = "WaitSetResponse")]
+    wait_set_response: Option<WaitSetResponse>,
+    #[serde(rename = "Fault")]
+    fault: Option<SoapFault>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WaitSetResponse {
+    seq: String,
+    /// Accounts reporting a change; empty means the call timed out with no changes.
+    #[serde(default)]
+    a: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1128,5 +1318,75 @@ mod tests {
         let message = envelope.body.get_msg_response.unwrap().m.into_iter().next().unwrap();
         let body = message.mp.into_iter().find(|p| p.body && p.ct == "text/plain").map(|p| p.content);
         assert_eq!(body, None);
+    }
+
+    #[test]
+    fn get_info_response_parses_account_id() {
+        let raw = r#"{
+            "Body": {
+                "GetInfoResponse": {
+                    "id": "788c414c-386c-4c6a-be83-03523f4ba5fe",
+                    "name": "zpush-test@afatyo.com"
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<GetInfoBody> = serde_json::from_str(raw).unwrap();
+        assert_eq!(envelope.body.get_info_response.unwrap().id, "788c414c-386c-4c6a-be83-03523f4ba5fe");
+    }
+
+    #[test]
+    fn create_waitset_response_parses_id_and_numeric_seq() {
+        // Shape matches a real CreateWaitSetRequest hit, captured live from
+        // Carbonio CE 4.5.14: `seq` comes back as a bare JSON number here,
+        // unlike WaitSetResponse's string `seq`.
+        let raw = r#"{
+            "Body": {
+                "CreateWaitSetResponse": {
+                    "waitSet": "WaitSet-77b6fda6-d862-4c83-b39f-d0679e10e6c3",
+                    "defTypes": "f,m,c,a",
+                    "seq": 0
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<CreateWaitSetBody> = serde_json::from_str(raw).unwrap();
+        let resp = envelope.body.create_wait_set_response.unwrap();
+        assert_eq!(resp.wait_set, "WaitSet-77b6fda6-d862-4c83-b39f-d0679e10e6c3");
+        assert_eq!(resp.seq, serde_json::json!(0));
+    }
+
+    #[test]
+    fn wait_set_response_with_no_accounts_means_no_changes() {
+        let raw = r#"{
+            "Body": {
+                "WaitSetResponse": {
+                    "waitSet": "WaitSet-77b6fda6-d862-4c83-b39f-d0679e10e6c3",
+                    "seq": "0"
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<WaitSetBody> = serde_json::from_str(raw).unwrap();
+        let resp = envelope.body.wait_set_response.unwrap();
+        assert!(resp.a.is_empty());
+        assert_eq!(resp.seq, "0");
+    }
+
+    #[test]
+    fn wait_set_response_with_accounts_means_something_changed() {
+        let raw = r#"{
+            "Body": {
+                "WaitSetResponse": {
+                    "waitSet": "WaitSet-77b6fda6-d862-4c83-b39f-d0679e10e6c3",
+                    "seq": "1",
+                    "a": [{"id": "abc", "type": "m"}]
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<WaitSetBody> = serde_json::from_str(raw).unwrap();
+        let resp = envelope.body.wait_set_response.unwrap();
+        assert!(!resp.a.is_empty());
     }
 }
