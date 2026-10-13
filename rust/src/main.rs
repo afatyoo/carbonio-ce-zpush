@@ -1,6 +1,7 @@
 mod activesync_http;
 mod carbonio;
 mod codepages;
+mod mime_lite;
 mod server;
 mod sync_state;
 mod tls_pinning;
@@ -36,12 +37,12 @@ async fn main() -> Result<()> {
         _ => None,
     };
 
-    let state = AppState {
-        carbonio_base_url,
-        carbonio_tls,
-        carbonio_dns_override,
-        sync_state: SyncStateStore::new(),
+    let sync_state = match std::env::var("SYNC_STATE_PATH") {
+        Ok(path) => SyncStateStore::load_or_create(&path)?,
+        Err(_) => SyncStateStore::new(),
     };
+
+    let state = AppState { carbonio_base_url, carbonio_tls, carbonio_dns_override, sync_state };
     let router = server::build_router(state);
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
     println!("carbonio-ce-zpush listening on {listen_addr}");

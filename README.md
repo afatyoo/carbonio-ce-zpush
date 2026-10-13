@@ -18,9 +18,12 @@ Early, working foundation, not yet feature-complete. Verified end-to-end against
 - [x] `Sync` command for email: SyncKey "0" returns the current message list and a new key. The same key again returns Status 1 with no changes. A stale or unknown key returns Status 3 (invalid sync key, per MS-ASCMD 2.2.4), telling the device to sync again from scratch
 - [x] `Provision`: accepts any device so clients that refuse to sync without it can get past the handshake. Does not enforce any EAS policy (no PIN, encryption, or remote wipe checks)
 - [x] `Ping`: responds immediately with "no changes" instead of actually long-polling Carbonio for new mail, so devices poll in a loop rather than holding one open connection
-- [x] Persistent SyncKey tracking, per (user, device, collection), in memory for the life of the process (lost on restart, not yet written to disk)
+- [x] Persistent SyncKey tracking, per (user, device, collection), snapshotted to a JSON file after every change (set `SYNC_STATE_PATH`) so a restart does not force every device into a fresh FolderSync. Verified across an actual process restart against the live server
+- [x] `SendMsgRequest` (`urn:zimbraMail`): send an email through Carbonio
+- [x] `SendMail` command: parses the device's raw RFC 822 body (headers + plain text, no multipart/MIME yet) and relays it to Carbonio. Verified end-to-end: sent a real message that landed in a live mailbox
 - [ ] Calendar/Contacts/Tasks item sync (folder listing works for them today via FolderSync, item sync does not)
-- [ ] `SendMail`, `ItemOperations`, `GetItemEstimate`
+- [ ] `ItemOperations`, `GetItemEstimate`
+- [ ] HTML bodies and attachments in `SendMail` (multipart/MIME parsing)
 - [ ] Real push: `Ping` needs a Carbonio-side change notification to actually block until new mail arrives
 - [ ] FolderSync's own SyncKey is still hardcoded to "1" on every call, unlike the per-collection Sync command, which now tracks a real key
 
@@ -52,6 +55,8 @@ export CARBONIO_TLS_IP="192.168.x.x"
 cargo run
 ```
 
+Optional: `export SYNC_STATE_PATH="sync_state.json"` to persist SyncKeys across restarts. Without it, state is in-memory only and every device starts from a fresh FolderSync whenever the process restarts.
+
 Certificates are not committed (`rust/certs/*.pem` is gitignored, since it's server-identifying material). Copy them from the Carbonio host yourself, e.g.:
 
 ```bash
@@ -69,9 +74,10 @@ scp root@<carbonio-host>:/opt/zextras/ssl/carbonio/server/server.crt rust/certs/
 | `src/tls_pinning.rs` | Custom `rustls` certificate verifier for pinned-cert mode |
 | `src/wbxml.rs` | WBXML binary codec (encode/decode), codepage-table driven |
 | `src/codepages.rs` | WBXML codepage token tables (AirSync, Email, FolderHierarchy, Ping, Provision) and Carbonio→ActiveSync folder type mapping |
-| `src/sync_state.rs` | In-memory SyncKey store, per (user, device, collection) |
+| `src/sync_state.rs` | SyncKey store, per (user, device, collection), with optional JSON-file persistence |
+| `src/mime_lite.rs` | Minimal RFC 822 header/body parser for `SendMail` bodies |
 | `src/activesync_http.rs` | ActiveSync HTTP framing: Basic Auth header, `Cmd`/`User`/`DeviceId`/`DeviceType` query parsing |
-| `src/server.rs` | `axum` HTTP server, command dispatch (`FolderSync`, `Sync`, `Provision`, `Ping`) |
+| `src/server.rs` | `axum` HTTP server, command dispatch (`FolderSync`, `Sync`, `Provision`, `Ping`, `SendMail`) |
 
 ## Why Rust
 

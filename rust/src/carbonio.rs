@@ -381,6 +381,71 @@ impl CarbonioClient {
 
         Ok(raw_messages.into_iter().map(RawMessage::into_carbonio_message).collect())
     }
+
+    /// Sends a plain-text email via `SendMsgRequest` (`urn:zimbraMail`).
+    /// Does not support HTML bodies or attachments yet; `to`/`cc` are the
+    /// raw address strings as parsed from the device's RFC 822 headers.
+    pub async fn send_message(&self, to: &[String], cc: &[String], subject: &str, body: &str) -> Result<()> {
+        let token = self
+            .auth_token
+            .as_deref()
+            .context("send_message called before authenticate")?;
+
+        let mut participants: Vec<_> = to.iter().map(|addr| json!({ "t": "t", "a": addr })).collect();
+        participants.extend(cc.iter().map(|addr| json!({ "t": "c", "a": addr })));
+
+        let request_body = json!({
+            "Body": {
+                "SendMsgRequest": {
+                    "_jsns": "urn:zimbraMail",
+                    "m": {
+                        "su": { "_content": subject },
+                        "e": participants,
+                        "mp": {
+                            "ct": "text/plain",
+                            "content": { "_content": body }
+                        }
+                    }
+                }
+            },
+            "Header": {
+                "context": {
+                    "_jsns": "urn:zimbra",
+                    "authToken": { "_content": token }
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("SendMsgRequest failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<SendMsgBody> = response
+            .json()
+            .await
+            .context("SendMsgRequest response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault
+                .detail
+                .map(|d| d.error.code)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio SendMsgRequest failed ({code}): {}", fault.reason.text);
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SendMsgBody {
+    #[serde(rename = "Fault")]
+    fault: Option<SoapFault>,
 }
 
 #[derive(Debug, Deserialize)]

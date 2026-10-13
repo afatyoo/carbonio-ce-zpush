@@ -5,6 +5,7 @@ use crate::codepages::{
     folderhierarchy_encode_table, merge_encode_tables, ping_encode_table, provision_encode_table,
     PAGE_FOLDERHIERARCHY, PAGE_PING, PAGE_PROVISION,
 };
+use crate::mime_lite::parse_rfc822;
 use crate::sync_state::SyncStateStore;
 use crate::wbxml::{find_text_child, WbxmlDecoder, WbxmlEncoder, WbxmlNode};
 use axum::{
@@ -117,6 +118,7 @@ async fn handle_activesync(
         "Sync" => handle_sync(&mut client, &state.sync_state, &request, &body).await,
         "Provision" => handle_provision(),
         "Ping" => handle_ping(),
+        "SendMail" => handle_send_mail(&client, &body).await,
         other => (
             StatusCode::NOT_IMPLEMENTED,
             format!("'{other}' is accepted but not yet wired to a Carbonio handler"),
@@ -382,6 +384,23 @@ fn handle_ping() -> Response {
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
     };
     (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
+}
+
+/// Handles `SendMail`: the request body is a raw RFC 822 message (modern
+/// ActiveSync sends plain MIME here, not WBXML), parsed just enough to
+/// pull Subject/To/Cc/body and relay it through Carbonio's SendMsgRequest.
+/// HTML bodies and attachments (multipart MIME) are not parsed out
+/// separately yet; the raw body text is sent as-is as a text/plain part.
+async fn handle_send_mail(client: &CarbonioClient, body: &[u8]) -> Response {
+    let parsed = parse_rfc822(body);
+    if parsed.to.is_empty() {
+        return (StatusCode::BAD_REQUEST, "SendMail body had no To recipients").into_response();
+    }
+
+    match client.send_message(&parsed.to, &parsed.cc, &parsed.subject, &parsed.body).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("SendMsgRequest to Carbonio failed: {e}")).into_response(),
+    }
 }
 
 /// Placeholder until a real logging crate (tracing) is wired in; keeps the
