@@ -205,6 +205,26 @@ impl<'a> WbxmlEncoder<'a> {
     }
 }
 
+/// Recursively finds the first `<tag_name>text</tag_name>` in a decoded
+/// WBXML tree and returns its text content. Used to pull fields like
+/// `SyncKey` or `CollectionId` out of a command body without needing a full
+/// typed model of every ActiveSync request shape.
+pub fn find_text_child(nodes: &[WbxmlNode], tag_name: &str) -> Option<String> {
+    for node in nodes {
+        if let WbxmlNode::Tag { name, children } = node {
+            if name == tag_name {
+                if let Some(WbxmlNode::Text(text)) = children.first() {
+                    return Some(text.clone());
+                }
+            }
+            if let Some(found) = find_text_child(children, tag_name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +305,32 @@ mod tests {
         let stream = vec![WBXML_VERSION, PUBLIC_ID_UNKNOWN, CHARSET_UTF8, 0x00, 0x3A];
         let err = WbxmlDecoder::new(&stream, &decode_table).decode().unwrap_err();
         assert!(err.to_string().contains("unknown tag token"));
+    }
+
+    #[test]
+    fn find_text_child_locates_a_nested_tag() {
+        let tree = vec![WbxmlNode::Tag {
+            name: "Sync".into(),
+            children: vec![WbxmlNode::Tag {
+                name: "Collections".into(),
+                children: vec![WbxmlNode::Tag {
+                    name: "Collection".into(),
+                    children: vec![
+                        WbxmlNode::Tag {
+                            name: "SyncKey".into(),
+                            children: vec![WbxmlNode::Text("2".into())],
+                        },
+                        WbxmlNode::Tag {
+                            name: "CollectionId".into(),
+                            children: vec![WbxmlNode::Text("5".into())],
+                        },
+                    ],
+                }],
+            }],
+        }];
+
+        assert_eq!(find_text_child(&tree, "SyncKey"), Some("2".to_string()));
+        assert_eq!(find_text_child(&tree, "CollectionId"), Some("5".to_string()));
+        assert_eq!(find_text_child(&tree, "Missing"), None);
     }
 }

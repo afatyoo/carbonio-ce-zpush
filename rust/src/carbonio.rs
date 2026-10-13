@@ -311,6 +311,130 @@ struct RawFolder {
     folder: Vec<RawFolder>,
 }
 
+/// One email message, as returned by `SearchRequest` and trimmed to the
+/// fields the `Sync` command's Email codepage currently emits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CarbonioMessage {
+    pub id: String,
+    pub subject: String,
+    pub from: Option<String>,
+    pub to: Vec<String>,
+    /// Milliseconds since the Unix epoch, as Zimbra/Carbonio reports it.
+    pub date_epoch_ms: i64,
+    pub unread: bool,
+}
+
+impl CarbonioClient {
+    /// Lists up to `limit` messages in `folder_id`, newest first, via
+    /// `SearchRequest` (`urn:zimbraMail`) with query `inid:<folder_id>`.
+    pub async fn search_messages(&self, folder_id: &str, limit: u32) -> Result<Vec<CarbonioMessage>> {
+        let token = self
+            .auth_token
+            .as_deref()
+            .context("search_messages called before authenticate")?;
+
+        let request_body = json!({
+            "Body": {
+                "SearchRequest": {
+                    "_jsns": "urn:zimbraMail",
+                    "types": "message",
+                    "query": { "_content": format!("inid:{folder_id}") },
+                    "sortBy": "dateDesc",
+                    "limit": limit
+                }
+            },
+            "Header": {
+                "context": {
+                    "_jsns": "urn:zimbra",
+                    "authToken": { "_content": token }
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("SearchRequest failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<SearchBody> = response
+            .json()
+            .await
+            .context("SearchRequest response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault
+                .detail
+                .map(|d| d.error.code)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio SearchRequest failed ({code}): {}", fault.reason.text);
+        }
+
+        let raw_messages = envelope
+            .body
+            .search_response
+            .context("SearchResponse missing from a non-fault SOAP reply")?
+            .m;
+
+        Ok(raw_messages.into_iter().map(RawMessage::into_carbonio_message).collect())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchBody {
+    #[serde(rename = "SearchResponse")]
+    search_response: Option<SearchResponse>,
+    #[serde(rename = "Fault")]
+    fault: Option<SoapFault>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchResponse {
+    #[serde(default)]
+    m: Vec<RawMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMessage {
+    id: String,
+    su: Option<ContentField>,
+    /// Date in milliseconds since the Unix epoch.
+    d: Option<i64>,
+    /// Flag string; Zimbra/Carbonio uses 'u' for unread among others.
+    f: Option<String>,
+    #[serde(default)]
+    e: Vec<RawEmailAddr>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawEmailAddr {
+    a: String,
+    t: Option<String>,
+}
+
+impl RawMessage {
+    fn into_carbonio_message(self) -> CarbonioMessage {
+        let from = self.e.iter().find(|addr| addr.t.as_deref() == Some("f")).map(|addr| addr.a.clone());
+        let to = self
+            .e
+            .iter()
+            .filter(|addr| addr.t.as_deref() == Some("t"))
+            .map(|addr| addr.a.clone())
+            .collect();
+        CarbonioMessage {
+            id: self.id,
+            subject: self.su.map(|s| s.content).unwrap_or_default(),
+            from,
+            to,
+            date_epoch_ms: self.d.unwrap_or(0),
+            unread: self.f.as_deref().is_some_and(|flags| flags.contains('u')),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,5 +527,63 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn search_response_maps_sender_recipients_and_unread_flag() {
+        // Shape matches a real SearchRequest hit: one unread message from
+        // alice to bob and carol.
+        let raw = r#"{
+            "Body": {
+                "SearchResponse": {
+                    "m": [{
+                        "id": "123",
+                        "su": {"_content": "Weekly report"},
+                        "d": 1760000000000,
+                        "f": "u",
+                        "e": [
+                            {"a": "alice@afatyo.com", "t": "f"},
+                            {"a": "bob@afatyo.com", "t": "t"},
+                            {"a": "carol@afatyo.com", "t": "t"}
+                        ]
+                    }]
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+
+        let envelope: SoapEnvelope<SearchBody> = serde_json::from_str(raw).unwrap();
+        let raw_messages = envelope.body.search_response.unwrap().m;
+        let messages: Vec<CarbonioMessage> =
+            raw_messages.into_iter().map(RawMessage::into_carbonio_message).collect();
+
+        assert_eq!(
+            messages,
+            vec![CarbonioMessage {
+                id: "123".into(),
+                subject: "Weekly report".into(),
+                from: Some("alice@afatyo.com".into()),
+                to: vec!["bob@afatyo.com".into(), "carol@afatyo.com".into()],
+                date_epoch_ms: 1760000000000,
+                unread: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn search_response_without_flags_is_read() {
+        let raw = r#"{
+            "Body": {
+                "SearchResponse": {
+                    "m": [{"id": "1", "su": {"_content": "Hi"}, "d": 1, "e": []}]
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<SearchBody> = serde_json::from_str(raw).unwrap();
+        let raw_messages = envelope.body.search_response.unwrap().m;
+        let messages: Vec<CarbonioMessage> =
+            raw_messages.into_iter().map(RawMessage::into_carbonio_message).collect();
+        assert!(!messages[0].unread);
     }
 }

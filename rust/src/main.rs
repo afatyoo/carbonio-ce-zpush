@@ -2,11 +2,13 @@ mod activesync_http;
 mod carbonio;
 mod codepages;
 mod server;
+mod sync_state;
 mod tls_pinning;
 mod wbxml;
 
 use anyhow::Result;
 use server::{AppState, CarbonioTls};
+use sync_state::SyncStateStore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,7 +36,12 @@ async fn main() -> Result<()> {
         _ => None,
     };
 
-    let state = AppState { carbonio_base_url, carbonio_tls, carbonio_dns_override };
+    let state = AppState {
+        carbonio_base_url,
+        carbonio_tls,
+        carbonio_dns_override,
+        sync_state: SyncStateStore::new(),
+    };
     let router = server::build_router(state);
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
     println!("carbonio-ce-zpush listening on {listen_addr}");

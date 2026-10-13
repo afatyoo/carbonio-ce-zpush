@@ -1,12 +1,59 @@
 use std::collections::HashMap;
 
-/// WBXML codepage 0: AirSync. Token values per [MS-ASWBXML] section 2.1.2.1.
+/// WBXML codepage tokens per [MS-ASWBXML]. Each codepage is a distinct XML
+/// namespace in the uncompressed ActiveSync XML; WBXML switches between them
+/// with a `SWITCH_PAGE` byte.
 pub const PAGE_AIRSYNC: u8 = 0x00;
-/// WBXML codepage 7: FolderHierarchy. Token values per [MS-ASWBXML] section 2.1.2.8.
+pub const PAGE_EMAIL: u8 = 0x02;
 pub const PAGE_FOLDERHIERARCHY: u8 = 0x07;
+pub const PAGE_PING: u8 = 0x0D;
+pub const PAGE_PROVISION: u8 = 0x0E;
 
-/// Tag names used by the FolderSync command and response, mapped to their
-/// FolderHierarchy codepage tokens.
+/// AirSync (codepage 0) tags, [MS-ASWBXML] 2.1.2.1. Only the subset this
+/// server currently emits/consumes for FolderSync and item Sync.
+const AIRSYNC_TAGS: &[(u8, &str)] = &[
+    (0x05, "Sync"),
+    (0x06, "Responses"),
+    (0x07, "Add"),
+    (0x08, "Change"),
+    (0x09, "Delete"),
+    (0x0A, "Fetch"),
+    (0x0B, "SyncKey"),
+    (0x0C, "ClientId"),
+    (0x0D, "ServerId"),
+    (0x0E, "Status"),
+    (0x0F, "Collection"),
+    (0x10, "Class"),
+    (0x11, "Version"),
+    (0x12, "CollectionId"),
+    (0x13, "GetChanges"),
+    (0x14, "MoreAvailable"),
+    (0x15, "WindowSize"),
+    (0x16, "Commands"),
+    (0x17, "Options"),
+    (0x18, "FilterType"),
+    (0x1C, "Collections"),
+    (0x1D, "ApplicationData"),
+    (0x1E, "DeletesAsMoves"),
+    (0x25, "Limit"),
+];
+
+/// Email (codepage 2) tags, [MS-ASWBXML] 2.1.2.3. Minimal field set for a
+/// readable message list (no attachments/MIME/meeting-request fields yet).
+const EMAIL_TAGS: &[(u8, &str)] = &[
+    (0x0F, "DateReceived"),
+    (0x11, "DisplayTo"),
+    (0x12, "Importance"),
+    (0x13, "MessageClass"),
+    (0x14, "Subject"),
+    (0x15, "Read"),
+    (0x16, "To"),
+    (0x17, "Cc"),
+    (0x18, "From"),
+    (0x3A, "Flag"),
+];
+
+/// FolderHierarchy (codepage 7) tags, [MS-ASWBXML] 2.1.2.8.
 const FOLDERHIERARCHY_TAGS: &[(u8, &str)] = &[
     (0x05, "Folders"),
     (0x06, "Folder"),
@@ -26,6 +73,33 @@ const FOLDERHIERARCHY_TAGS: &[(u8, &str)] = &[
     (0x15, "FolderUpdate"),
     (0x16, "FolderSync"),
     (0x17, "Count"),
+];
+
+/// Ping (codepage 13) tags, [MS-ASWBXML] 2.1.2.13.
+const PING_TAGS: &[(u8, &str)] = &[
+    (0x05, "Ping"),
+    (0x06, "AutdState"),
+    (0x07, "Status"),
+    (0x08, "HeartbeatInterval"),
+    (0x09, "Folders"),
+    (0x0A, "Folder"),
+    (0x0B, "Id"),
+    (0x0C, "Class"),
+    (0x0D, "MaxFolders"),
+];
+
+/// Provision (codepage 14) tags, [MS-ASWBXML] 2.1.2.14. Minimal subset: this
+/// server accepts any device and does not enforce EAS policy payloads.
+const PROVISION_TAGS: &[(u8, &str)] = &[
+    (0x05, "Provision"),
+    (0x06, "Policies"),
+    (0x07, "Policy"),
+    (0x08, "PolicyType"),
+    (0x09, "PolicyKey"),
+    (0x0A, "Data"),
+    (0x0B, "Status"),
+    (0x0C, "RemoteWipe"),
+    (0x0E, "DeviceInformation"),
 ];
 
 /// ActiveSync folder type codes (MS-ASCMD 2.2.3.165.1) for the Carbonio/Zimbra
@@ -51,24 +125,88 @@ pub fn activesync_folder_type(view: Option<&str>) -> &'static str {
     }
 }
 
-pub fn folderhierarchy_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
-    let mut page = HashMap::new();
-    for (token, name) in FOLDERHIERARCHY_TAGS {
-        page.insert(*token, *name);
+fn build_decode_table(page: u8, tags: &[(u8, &'static str)]) -> HashMap<u8, HashMap<u8, &'static str>> {
+    let mut inner = HashMap::new();
+    for (token, name) in tags {
+        inner.insert(*token, *name);
     }
     let mut pages = HashMap::new();
-    pages.insert(PAGE_FOLDERHIERARCHY, page);
+    pages.insert(page, inner);
     pages
 }
 
-pub fn folderhierarchy_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
-    let mut page = HashMap::new();
-    for (token, name) in FOLDERHIERARCHY_TAGS {
-        page.insert(*name, *token);
+fn build_encode_table(page: u8, tags: &[(u8, &'static str)]) -> HashMap<u8, HashMap<&'static str, u8>> {
+    let mut inner = HashMap::new();
+    for (token, name) in tags {
+        inner.insert(*name, *token);
     }
     let mut pages = HashMap::new();
-    pages.insert(PAGE_FOLDERHIERARCHY, page);
+    pages.insert(page, inner);
     pages
+}
+
+/// Merges several single-page tables into one multi-codepage table, for
+/// documents (like a `Sync` response) that mix AirSync and Email tags.
+pub fn merge_decode_tables(
+    tables: Vec<HashMap<u8, HashMap<u8, &'static str>>>,
+) -> HashMap<u8, HashMap<u8, &'static str>> {
+    let mut merged = HashMap::new();
+    for table in tables {
+        merged.extend(table);
+    }
+    merged
+}
+
+pub fn merge_encode_tables(
+    tables: Vec<HashMap<u8, HashMap<&'static str, u8>>>,
+) -> HashMap<u8, HashMap<&'static str, u8>> {
+    let mut merged = HashMap::new();
+    for table in tables {
+        merged.extend(table);
+    }
+    merged
+}
+
+pub fn airsync_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
+    build_decode_table(PAGE_AIRSYNC, AIRSYNC_TAGS)
+}
+pub fn airsync_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
+    build_encode_table(PAGE_AIRSYNC, AIRSYNC_TAGS)
+}
+pub fn email_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
+    build_decode_table(PAGE_EMAIL, EMAIL_TAGS)
+}
+pub fn email_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
+    build_encode_table(PAGE_EMAIL, EMAIL_TAGS)
+}
+pub fn folderhierarchy_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
+    build_decode_table(PAGE_FOLDERHIERARCHY, FOLDERHIERARCHY_TAGS)
+}
+pub fn folderhierarchy_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
+    build_encode_table(PAGE_FOLDERHIERARCHY, FOLDERHIERARCHY_TAGS)
+}
+pub fn ping_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
+    build_decode_table(PAGE_PING, PING_TAGS)
+}
+pub fn ping_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
+    build_encode_table(PAGE_PING, PING_TAGS)
+}
+pub fn provision_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
+    build_decode_table(PAGE_PROVISION, PROVISION_TAGS)
+}
+pub fn provision_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
+    build_encode_table(PAGE_PROVISION, PROVISION_TAGS)
+}
+
+/// Looks up which codepage a tag name belongs to, across the AirSync +
+/// Email tables -- the combination a `Sync` command's response needs.
+pub fn airsync_sync_page_of(tag_name: &str) -> u8 {
+    let airsync = AIRSYNC_TAGS.iter().any(|(_, name)| *name == tag_name);
+    if airsync {
+        PAGE_AIRSYNC
+    } else {
+        PAGE_EMAIL
+    }
 }
 
 #[cfg(test)]
@@ -90,13 +228,28 @@ mod tests {
     }
 
     #[test]
-    fn encode_and_decode_tables_are_inverse_of_each_other() {
-        let decode = folderhierarchy_decode_table();
-        let encode = folderhierarchy_encode_table();
-        let decode_page = &decode[&PAGE_FOLDERHIERARCHY];
-        let encode_page = &encode[&PAGE_FOLDERHIERARCHY];
-        for (token, name) in decode_page {
-            assert_eq!(encode_page.get(name), Some(token));
+    fn all_tables_round_trip_token_name_lookups() {
+        for (decode, encode) in [
+            (airsync_decode_table(), airsync_encode_table()),
+            (email_decode_table(), email_encode_table()),
+            (folderhierarchy_decode_table(), folderhierarchy_encode_table()),
+            (ping_decode_table(), ping_encode_table()),
+            (provision_decode_table(), provision_encode_table()),
+        ] {
+            for (page, tokens) in &decode {
+                let encode_page = &encode[page];
+                for (token, name) in tokens {
+                    assert_eq!(encode_page.get(name), Some(token), "mismatch for {name} on page {page}");
+                }
+            }
         }
+    }
+
+    #[test]
+    fn page_of_routes_airsync_and_email_tags_correctly() {
+        assert_eq!(airsync_sync_page_of("Sync"), PAGE_AIRSYNC);
+        assert_eq!(airsync_sync_page_of("CollectionId"), PAGE_AIRSYNC);
+        assert_eq!(airsync_sync_page_of("Subject"), PAGE_EMAIL);
+        assert_eq!(airsync_sync_page_of("From"), PAGE_EMAIL);
     }
 }

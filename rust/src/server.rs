@@ -1,7 +1,12 @@
-use crate::activesync_http::{ensure_supported_command, parse_activesync_query, parse_basic_auth};
+use crate::activesync_http::{ensure_supported_command, parse_activesync_query, parse_basic_auth, ActiveSyncRequest};
 use crate::carbonio::CarbonioClient;
-use crate::codepages::{activesync_folder_type, folderhierarchy_encode_table, PAGE_FOLDERHIERARCHY};
-use crate::wbxml::{WbxmlEncoder, WbxmlNode};
+use crate::codepages::{
+    activesync_folder_type, airsync_encode_table, airsync_sync_page_of, email_encode_table,
+    folderhierarchy_encode_table, merge_encode_tables, ping_encode_table, provision_encode_table,
+    PAGE_FOLDERHIERARCHY, PAGE_PING, PAGE_PROVISION,
+};
+use crate::sync_state::SyncStateStore;
+use crate::wbxml::{find_text_child, WbxmlDecoder, WbxmlEncoder, WbxmlNode};
 use axum::{
     body::Bytes,
     extract::OriginalUri,
@@ -10,6 +15,7 @@ use axum::{
     routing::post,
     Router,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// How to validate Carbonio's TLS certificate.
@@ -26,13 +32,15 @@ pub enum CarbonioTls {
 }
 
 /// Shared server config: where Carbonio lives and how to trust its TLS cert.
-#[derive(Clone)]
+/// Always accessed through the `Arc<AppState>` the router holds, never
+/// cloned directly (it owns the non-`Clone` `SyncStateStore`).
 pub struct AppState {
     pub carbonio_base_url: String,
     pub carbonio_tls: CarbonioTls,
     /// `(hostname_in_cert, ip_to_dial)`, for when Carbonio's TLS cert names a
     /// host with no real DNS record. See [`CarbonioClient::new_with_ca`].
     pub carbonio_dns_override: Option<(String, std::net::IpAddr)>,
+    pub sync_state: SyncStateStore,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -106,6 +114,9 @@ async fn handle_activesync(
 
     match request.command.as_str() {
         "FolderSync" => handle_folder_sync(&mut client).await,
+        "Sync" => handle_sync(&mut client, &state.sync_state, &request, &body).await,
+        "Provision" => handle_provision(),
+        "Ping" => handle_ping(),
         other => (
             StatusCode::NOT_IMPLEMENTED,
             format!("'{other}' is accepted but not yet wired to a Carbonio handler"),
@@ -185,6 +196,192 @@ async fn handle_folder_sync(client: &mut CarbonioClient) -> Response {
         encoded,
     )
         .into_response()
+}
+
+/// Handles the `Sync` command for a single email collection (multi-collection
+/// requests, and Calendar/Contacts/Tasks item sync, are not implemented
+/// yet). SyncKey handling:
+/// - client sends "0": first sync, assign a new key and return the current
+///   message list as `<Add>` entries.
+/// - client sends the store's current key: already caught up, no known new
+///   mail is tracked yet, so this returns zero changes (not true delta
+///   sync; new mail since the last Sync is not detected until the device
+///   issues another "0" or until real change-tracking lands).
+/// - client sends anything else (stale/unknown key): Status 3 (invalid
+///   sync key per MS-ASCMD 2.2.4), telling the device to FolderSync/Sync
+///   again from scratch.
+async fn handle_sync(
+    client: &mut CarbonioClient,
+    sync_state: &SyncStateStore,
+    request: &ActiveSyncRequest,
+    body: &[u8],
+) -> Response {
+    let decode_table = crate::codepages::airsync_decode_table();
+    let nodes = match WbxmlDecoder::new(body, &decode_table).decode() {
+        Ok(n) => n,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("failed to decode Sync body: {e}")).into_response(),
+    };
+
+    let client_sync_key = find_text_child(&nodes, "SyncKey").unwrap_or_else(|| "0".to_string());
+    let collection_id = match find_text_child(&nodes, "CollectionId") {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, "Sync body missing CollectionId").into_response(),
+    };
+
+    let current_key = sync_state.current_key(&request.user, &request.device_id, &collection_id);
+
+    let (new_key, adds) = if client_sync_key == "0" {
+        let messages = match client.search_messages(&collection_id, 25).await {
+            Ok(m) => m,
+            Err(e) => return (StatusCode::BAD_GATEWAY, format!("SearchRequest from Carbonio failed: {e}")).into_response(),
+        };
+        let new_key = sync_state.advance_key(&request.user, &request.device_id, &collection_id);
+        let adds = messages
+            .iter()
+            .map(|m| WbxmlNode::Tag {
+                name: "Add".into(),
+                children: vec![
+                    WbxmlNode::Tag {
+                        name: "ServerId".into(),
+                        children: vec![WbxmlNode::Text(m.id.clone())],
+                    },
+                    WbxmlNode::Tag {
+                        name: "ApplicationData".into(),
+                        children: vec![
+                            WbxmlNode::Tag {
+                                name: "Subject".into(),
+                                children: vec![WbxmlNode::Text(m.subject.clone())],
+                            },
+                            WbxmlNode::Tag {
+                                name: "From".into(),
+                                children: vec![WbxmlNode::Text(m.from.clone().unwrap_or_default())],
+                            },
+                            WbxmlNode::Tag {
+                                name: "Read".into(),
+                                children: vec![WbxmlNode::Text(if m.unread { "0" } else { "1" }.into())],
+                            },
+                        ],
+                    },
+                ],
+            })
+            .collect();
+        (new_key, adds)
+    } else if client_sync_key == current_key {
+        (current_key, Vec::new())
+    } else {
+        return build_sync_response(&collection_id, "3", &current_key, Vec::new());
+    };
+
+    build_sync_response(&collection_id, "1", &new_key, adds)
+}
+
+fn build_sync_response(collection_id: &str, status: &str, sync_key: &str, adds: Vec<WbxmlNode>) -> Response {
+    let mut collection_children = vec![
+        WbxmlNode::Tag {
+            name: "Class".into(),
+            children: vec![WbxmlNode::Text("Email".into())],
+        },
+        WbxmlNode::Tag {
+            name: "SyncKey".into(),
+            children: vec![WbxmlNode::Text(sync_key.into())],
+        },
+        WbxmlNode::Tag {
+            name: "CollectionId".into(),
+            children: vec![WbxmlNode::Text(collection_id.into())],
+        },
+        WbxmlNode::Tag {
+            name: "Status".into(),
+            children: vec![WbxmlNode::Text(status.into())],
+        },
+    ];
+    if !adds.is_empty() {
+        collection_children.push(WbxmlNode::Tag { name: "Commands".into(), children: adds });
+    }
+
+    let tree = vec![WbxmlNode::Tag {
+        name: "Sync".into(),
+        children: vec![WbxmlNode::Tag {
+            name: "Collections".into(),
+            children: vec![WbxmlNode::Tag {
+                name: "Collection".into(),
+                children: collection_children,
+            }],
+        }],
+    }];
+
+    let encode_table = merge_encode_tables(vec![airsync_encode_table(), email_encode_table()]);
+    let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &airsync_sync_page_of) {
+        Ok(bytes) => bytes,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
+    };
+
+    (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
+}
+
+/// `Provision` accepts any device and does not enforce an EAS policy
+/// payload: no remote wipe, no PIN/encryption requirements are checked.
+/// This exists only so clients that refuse to sync without a successful
+/// Provision handshake (most modern phones) get past it.
+fn handle_provision() -> Response {
+    let tree = vec![WbxmlNode::Tag {
+        name: "Provision".into(),
+        children: vec![
+            WbxmlNode::Tag {
+                name: "Status".into(),
+                children: vec![WbxmlNode::Text("1".into())],
+            },
+            WbxmlNode::Tag {
+                name: "Policies".into(),
+                children: vec![WbxmlNode::Tag {
+                    name: "Policy".into(),
+                    children: vec![
+                        WbxmlNode::Tag {
+                            name: "PolicyType".into(),
+                            children: vec![WbxmlNode::Text("MS-EAS-Provisioning-WBXML".into())],
+                        },
+                        WbxmlNode::Tag {
+                            name: "Status".into(),
+                            children: vec![WbxmlNode::Text("1".into())],
+                        },
+                        WbxmlNode::Tag {
+                            name: "PolicyKey".into(),
+                            children: vec![WbxmlNode::Text("1".into())],
+                        },
+                    ],
+                }],
+            },
+        ],
+    }];
+
+    let encode_table = provision_encode_table();
+    let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &|_name| PAGE_PROVISION) {
+        Ok(bytes) => bytes,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
+    };
+    (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
+}
+
+/// `Ping` is meant to long-poll until Carbonio reports a change or a
+/// heartbeat timeout elapses (MS-ASCMD 2.2.2.11). This returns immediately
+/// with Status 1 ("no changes, ping me again") instead of actually
+/// watching Carbonio for new mail, so devices will poll in a tight loop
+/// rather than holding a real long connection. Real push support needs a
+/// Carbonio-side notification subscription, not implemented yet.
+fn handle_ping() -> Response {
+    let tree = vec![WbxmlNode::Tag {
+        name: "Ping".into(),
+        children: vec![WbxmlNode::Tag {
+            name: "Status".into(),
+            children: vec![WbxmlNode::Text("1".into())],
+        }],
+    }];
+
+    let encode_table = ping_encode_table();
+    let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &|_name| PAGE_PING) {
+        Ok(bytes) => bytes,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
+    };
+    (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
 }
 
 /// Placeholder until a real logging crate (tracing) is wired in; keeps the
