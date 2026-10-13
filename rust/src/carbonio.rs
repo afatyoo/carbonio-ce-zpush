@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 
 /// Minimal JSON-SOAP client for Zextras Carbonio CE's `urn:zimbraAccount` /
 /// `urn:zimbraMail` namespaces, reachable at `<base_url>/service/soap/`.
@@ -440,12 +441,115 @@ impl CarbonioClient {
 
         Ok(())
     }
+
+    /// Lists up to `limit` contacts in `folder_id`, via `SearchRequest`
+    /// (`urn:zimbraMail`) with `types=contact`. Only the fields a basic
+    /// ActiveSync contact needs are extracted from `_attrs`; anything else
+    /// Carbonio stores on the contact (addresses, notes, a photo, etc.) is
+    /// dropped.
+    pub async fn search_contacts(&self, folder_id: &str, limit: u32) -> Result<Vec<CarbonioContact>> {
+        let token = self
+            .auth_token
+            .as_deref()
+            .context("search_contacts called before authenticate")?;
+
+        let request_body = json!({
+            "Body": {
+                "SearchRequest": {
+                    "_jsns": "urn:zimbraMail",
+                    "types": "contact",
+                    "query": { "_content": format!("inid:{folder_id}") },
+                    "limit": limit
+                }
+            },
+            "Header": {
+                "context": {
+                    "_jsns": "urn:zimbra",
+                    "authToken": { "_content": token }
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("SearchRequest (contacts) failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<SearchContactsBody> = response
+            .json()
+            .await
+            .context("SearchRequest (contacts) response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault
+                .detail
+                .map(|d| d.error.code)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio SearchRequest (contacts) failed ({code}): {}", fault.reason.text);
+        }
+
+        let raw_contacts = envelope
+            .body
+            .search_response
+            .context("SearchResponse missing from a non-fault SOAP reply")?
+            .cn;
+
+        Ok(raw_contacts.into_iter().map(RawContact::into_carbonio_contact).collect())
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct SendMsgBody {
     #[serde(rename = "Fault")]
     fault: Option<SoapFault>,
+}
+
+/// One contact, trimmed to the fields the Contacts codepage currently emits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarbonioContact {
+    pub id: String,
+    pub first_name: String,
+    pub last_name: String,
+    pub email: String,
+    pub mobile_phone: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchContactsBody {
+    #[serde(rename = "SearchResponse")]
+    search_response: Option<SearchContactsResponse>,
+    #[serde(rename = "Fault")]
+    fault: Option<SoapFault>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchContactsResponse {
+    #[serde(default)]
+    cn: Vec<RawContact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawContact {
+    id: String,
+    #[serde(default)]
+    _attrs: HashMap<String, String>,
+}
+
+impl RawContact {
+    fn into_carbonio_contact(self) -> CarbonioContact {
+        let get = |key: &str| self._attrs.get(key).cloned().unwrap_or_default();
+        CarbonioContact {
+            id: self.id,
+            first_name: get("firstName"),
+            last_name: get("lastName"),
+            email: get("email"),
+            mobile_phone: get("mobilePhone"),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -650,5 +754,60 @@ mod tests {
         let messages: Vec<CarbonioMessage> =
             raw_messages.into_iter().map(RawMessage::into_carbonio_message).collect();
         assert!(!messages[0].unread);
+    }
+
+    #[test]
+    fn search_contacts_response_maps_known_attrs() {
+        // Shape matches a real CreateContactRequest/SearchRequest hit,
+        // captured live from Carbonio CE 4.5.14.
+        let raw = r#"{
+            "Body": {
+                "SearchResponse": {
+                    "cn": [{
+                        "id": "262",
+                        "l": "7",
+                        "fileAsStr": "Santoso, Budi",
+                        "_attrs": {
+                            "firstName": "Budi",
+                            "lastName": "Santoso",
+                            "mobilePhone": "08123456789",
+                            "email": "budi@afatyo.com"
+                        }
+                    }]
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+
+        let envelope: SoapEnvelope<SearchContactsBody> = serde_json::from_str(raw).unwrap();
+        let raw_contacts = envelope.body.search_response.unwrap().cn;
+        let contacts: Vec<CarbonioContact> =
+            raw_contacts.into_iter().map(RawContact::into_carbonio_contact).collect();
+
+        assert_eq!(
+            contacts,
+            vec![CarbonioContact {
+                id: "262".into(),
+                first_name: "Budi".into(),
+                last_name: "Santoso".into(),
+                email: "budi@afatyo.com".into(),
+                mobile_phone: "08123456789".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn contact_missing_attrs_defaults_to_empty_strings() {
+        let raw = r#"{
+            "Body": {
+                "SearchResponse": { "cn": [{"id": "1", "l": "7"}] }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<SearchContactsBody> = serde_json::from_str(raw).unwrap();
+        let raw_contacts = envelope.body.search_response.unwrap().cn;
+        let contacts: Vec<CarbonioContact> =
+            raw_contacts.into_iter().map(RawContact::into_carbonio_contact).collect();
+        assert_eq!(contacts[0].first_name, "");
     }
 }

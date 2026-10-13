@@ -4,6 +4,7 @@ use std::collections::HashMap;
 /// namespace in the uncompressed ActiveSync XML; WBXML switches between them
 /// with a `SWITCH_PAGE` byte.
 pub const PAGE_AIRSYNC: u8 = 0x00;
+pub const PAGE_CONTACTS: u8 = 0x01;
 pub const PAGE_EMAIL: u8 = 0x02;
 pub const PAGE_FOLDERHIERARCHY: u8 = 0x07;
 pub const PAGE_PING: u8 = 0x0D;
@@ -36,6 +37,16 @@ const AIRSYNC_TAGS: &[(u8, &str)] = &[
     (0x1D, "ApplicationData"),
     (0x1E, "DeletesAsMoves"),
     (0x25, "Limit"),
+];
+
+/// Contacts (codepage 1) tags, [MS-ASWBXML] 2.1.2.2. Minimal field set:
+/// name, one email address, one mobile number.
+const CONTACTS_TAGS: &[(u8, &str)] = &[
+    (0x1B, "Email1Address"),
+    (0x1E, "FileAs"),
+    (0x1F, "FirstName"),
+    (0x29, "LastName"),
+    (0x2B, "MobilePhoneNumber"),
 ];
 
 /// Email (codepage 2) tags, [MS-ASWBXML] 2.1.2.3. Minimal field set for a
@@ -179,6 +190,12 @@ pub fn email_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
 pub fn email_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
     build_encode_table(PAGE_EMAIL, EMAIL_TAGS)
 }
+pub fn contacts_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
+    build_decode_table(PAGE_CONTACTS, CONTACTS_TAGS)
+}
+pub fn contacts_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
+    build_encode_table(PAGE_CONTACTS, CONTACTS_TAGS)
+}
 pub fn folderhierarchy_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
     build_decode_table(PAGE_FOLDERHIERARCHY, FOLDERHIERARCHY_TAGS)
 }
@@ -198,15 +215,23 @@ pub fn provision_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
     build_encode_table(PAGE_PROVISION, PROVISION_TAGS)
 }
 
-/// Looks up which codepage a tag name belongs to, across the AirSync +
-/// Email tables -- the combination a `Sync` command's response needs.
-pub fn airsync_sync_page_of(tag_name: &str) -> u8 {
-    let airsync = AIRSYNC_TAGS.iter().any(|(_, name)| *name == tag_name);
-    if airsync {
-        PAGE_AIRSYNC
-    } else {
-        PAGE_EMAIL
+/// Looks up which codepage a tag name belongs to, across the AirSync table
+/// and one item-type table (Email or Contacts) -- the combination a `Sync`
+/// command's response needs: AirSync envelope tags plus that collection's
+/// own item fields.
+pub fn airsync_item_page_of(item_page: u8) -> impl Fn(&str) -> u8 {
+    move |tag_name: &str| {
+        if AIRSYNC_TAGS.iter().any(|(_, name)| *name == tag_name) {
+            PAGE_AIRSYNC
+        } else {
+            item_page
+        }
     }
+}
+
+/// Convenience alias for the email case, kept for existing call sites.
+pub fn airsync_sync_page_of(tag_name: &str) -> u8 {
+    airsync_item_page_of(PAGE_EMAIL)(tag_name)
 }
 
 #[cfg(test)]
@@ -232,6 +257,7 @@ mod tests {
         for (decode, encode) in [
             (airsync_decode_table(), airsync_encode_table()),
             (email_decode_table(), email_encode_table()),
+            (contacts_decode_table(), contacts_encode_table()),
             (folderhierarchy_decode_table(), folderhierarchy_encode_table()),
             (ping_decode_table(), ping_encode_table()),
             (provision_decode_table(), provision_encode_table()),

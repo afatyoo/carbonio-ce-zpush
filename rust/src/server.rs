@@ -1,9 +1,9 @@
 use crate::activesync_http::{ensure_supported_command, parse_activesync_query, parse_basic_auth, ActiveSyncRequest};
 use crate::carbonio::CarbonioClient;
 use crate::codepages::{
-    activesync_folder_type, airsync_encode_table, airsync_sync_page_of, email_encode_table,
-    folderhierarchy_encode_table, merge_encode_tables, ping_encode_table, provision_encode_table,
-    PAGE_FOLDERHIERARCHY, PAGE_PING, PAGE_PROVISION,
+    activesync_folder_type, airsync_encode_table, airsync_item_page_of, contacts_encode_table,
+    email_encode_table, folderhierarchy_encode_table, merge_encode_tables, ping_encode_table,
+    provision_encode_table, PAGE_CONTACTS, PAGE_EMAIL, PAGE_FOLDERHIERARCHY, PAGE_PING, PAGE_PROVISION,
 };
 use crate::mime_lite::parse_rfc822;
 use crate::sync_state::SyncStateStore;
@@ -16,7 +16,6 @@ use axum::{
     routing::post,
     Router,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// How to validate Carbonio's TLS certificate.
@@ -212,6 +211,23 @@ async fn handle_folder_sync(client: &mut CarbonioClient) -> Response {
 /// - client sends anything else (stale/unknown key): Status 3 (invalid
 ///   sync key per MS-ASCMD 2.2.4), telling the device to FolderSync/Sync
 ///   again from scratch.
+/// Which item type a collection holds, and how to sync it. Calendar/Tasks
+/// folders exist (FolderSync lists them) but have no entry here yet, so
+/// `Sync`-ing one returns an explicit "not implemented" instead of silently
+/// returning an empty or wrong-shaped item list.
+enum CollectionKind {
+    Email,
+    Contacts,
+}
+
+fn collection_kind_for_view(view: Option<&str>) -> Option<CollectionKind> {
+    match view {
+        Some("contact") => Some(CollectionKind::Contacts),
+        Some("message") | None => Some(CollectionKind::Email),
+        Some(_) => None,
+    }
+}
+
 async fn handle_sync(
     client: &mut CarbonioClient,
     sync_state: &SyncStateStore,
@@ -230,58 +246,124 @@ async fn handle_sync(
         None => return (StatusCode::BAD_REQUEST, "Sync body missing CollectionId").into_response(),
     };
 
+    let folders = match client.get_folders().await {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("GetFolder from Carbonio failed: {e}")).into_response(),
+    };
+    let view = folders.iter().find(|f| f.id == collection_id).and_then(|f| f.view.as_deref());
+    let kind = match collection_kind_for_view(view) {
+        Some(k) => k,
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                format!("Sync for folder view '{}' is not implemented (only email and contacts)", view.unwrap_or("?")),
+            )
+                .into_response()
+        }
+    };
+
     let current_key = sync_state.current_key(&request.user, &request.device_id, &collection_id);
 
     let (new_key, adds) = if client_sync_key == "0" {
-        let messages = match client.search_messages(&collection_id, 25).await {
-            Ok(m) => m,
-            Err(e) => return (StatusCode::BAD_GATEWAY, format!("SearchRequest from Carbonio failed: {e}")).into_response(),
+        let adds = match &kind {
+            CollectionKind::Email => match client.search_messages(&collection_id, 25).await {
+                Ok(messages) => messages.iter().map(email_to_add_node).collect(),
+                Err(e) => return (StatusCode::BAD_GATEWAY, format!("SearchRequest from Carbonio failed: {e}")).into_response(),
+            },
+            CollectionKind::Contacts => match client.search_contacts(&collection_id, 100).await {
+                Ok(contacts) => contacts.iter().map(contact_to_add_node).collect(),
+                Err(e) => return (StatusCode::BAD_GATEWAY, format!("SearchRequest (contacts) from Carbonio failed: {e}")).into_response(),
+            },
         };
         let new_key = sync_state.advance_key(&request.user, &request.device_id, &collection_id);
-        let adds = messages
-            .iter()
-            .map(|m| WbxmlNode::Tag {
-                name: "Add".into(),
-                children: vec![
-                    WbxmlNode::Tag {
-                        name: "ServerId".into(),
-                        children: vec![WbxmlNode::Text(m.id.clone())],
-                    },
-                    WbxmlNode::Tag {
-                        name: "ApplicationData".into(),
-                        children: vec![
-                            WbxmlNode::Tag {
-                                name: "Subject".into(),
-                                children: vec![WbxmlNode::Text(m.subject.clone())],
-                            },
-                            WbxmlNode::Tag {
-                                name: "From".into(),
-                                children: vec![WbxmlNode::Text(m.from.clone().unwrap_or_default())],
-                            },
-                            WbxmlNode::Tag {
-                                name: "Read".into(),
-                                children: vec![WbxmlNode::Text(if m.unread { "0" } else { "1" }.into())],
-                            },
-                        ],
-                    },
-                ],
-            })
-            .collect();
         (new_key, adds)
     } else if client_sync_key == current_key {
         (current_key, Vec::new())
     } else {
-        return build_sync_response(&collection_id, "3", &current_key, Vec::new());
+        return build_sync_response(&collection_id, "3", &current_key, Vec::new(), &kind);
     };
 
-    build_sync_response(&collection_id, "1", &new_key, adds)
+    build_sync_response(&collection_id, "1", &new_key, adds, &kind)
 }
 
-fn build_sync_response(collection_id: &str, status: &str, sync_key: &str, adds: Vec<WbxmlNode>) -> Response {
+fn email_to_add_node(m: &crate::carbonio::CarbonioMessage) -> WbxmlNode {
+    WbxmlNode::Tag {
+        name: "Add".into(),
+        children: vec![
+            WbxmlNode::Tag {
+                name: "ServerId".into(),
+                children: vec![WbxmlNode::Text(m.id.clone())],
+            },
+            WbxmlNode::Tag {
+                name: "ApplicationData".into(),
+                children: vec![
+                    WbxmlNode::Tag {
+                        name: "Subject".into(),
+                        children: vec![WbxmlNode::Text(m.subject.clone())],
+                    },
+                    WbxmlNode::Tag {
+                        name: "From".into(),
+                        children: vec![WbxmlNode::Text(m.from.clone().unwrap_or_default())],
+                    },
+                    WbxmlNode::Tag {
+                        name: "Read".into(),
+                        children: vec![WbxmlNode::Text(if m.unread { "0" } else { "1" }.into())],
+                    },
+                ],
+            },
+        ],
+    }
+}
+
+fn contact_to_add_node(c: &crate::carbonio::CarbonioContact) -> WbxmlNode {
+    WbxmlNode::Tag {
+        name: "Add".into(),
+        children: vec![
+            WbxmlNode::Tag {
+                name: "ServerId".into(),
+                children: vec![WbxmlNode::Text(c.id.clone())],
+            },
+            WbxmlNode::Tag {
+                name: "ApplicationData".into(),
+                children: vec![
+                    WbxmlNode::Tag {
+                        name: "FirstName".into(),
+                        children: vec![WbxmlNode::Text(c.first_name.clone())],
+                    },
+                    WbxmlNode::Tag {
+                        name: "LastName".into(),
+                        children: vec![WbxmlNode::Text(c.last_name.clone())],
+                    },
+                    WbxmlNode::Tag {
+                        name: "Email1Address".into(),
+                        children: vec![WbxmlNode::Text(c.email.clone())],
+                    },
+                    WbxmlNode::Tag {
+                        name: "MobilePhoneNumber".into(),
+                        children: vec![WbxmlNode::Text(c.mobile_phone.clone())],
+                    },
+                ],
+            },
+        ],
+    }
+}
+
+fn build_sync_response(
+    collection_id: &str,
+    status: &str,
+    sync_key: &str,
+    adds: Vec<WbxmlNode>,
+    kind: &CollectionKind,
+) -> Response {
+    let (class_name, item_page, item_encode_table) = match kind {
+        CollectionKind::Email => ("Email", PAGE_EMAIL, email_encode_table()),
+        CollectionKind::Contacts => ("Contacts", PAGE_CONTACTS, contacts_encode_table()),
+    };
+
     let mut collection_children = vec![
         WbxmlNode::Tag {
             name: "Class".into(),
-            children: vec![WbxmlNode::Text("Email".into())],
+            children: vec![WbxmlNode::Text(class_name.into())],
         },
         WbxmlNode::Tag {
             name: "SyncKey".into(),
@@ -311,8 +393,9 @@ fn build_sync_response(collection_id: &str, status: &str, sync_key: &str, adds: 
         }],
     }];
 
-    let encode_table = merge_encode_tables(vec![airsync_encode_table(), email_encode_table()]);
-    let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &airsync_sync_page_of) {
+    let encode_table = merge_encode_tables(vec![airsync_encode_table(), item_encode_table]);
+    let page_of = airsync_item_page_of(item_page);
+    let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &page_of) {
         Ok(bytes) => bytes,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
     };
