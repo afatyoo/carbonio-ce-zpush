@@ -16,6 +16,7 @@ pub const PAGE_PING: u8 = 0x0D;
 pub const PAGE_PROVISION: u8 = 0x0E;
 pub const PAGE_ITEMOPERATIONS: u8 = 0x14;
 pub const PAGE_SETTINGS: u8 = 0x12;
+pub const PAGE_AIRSYNCBASE: u8 = 0x11;
 
 /// AirSync (codepage 0) tags, [MS-ASWBXML] 2.1.2.1. Only the subset this
 /// server currently emits/consumes for FolderSync and item Sync.
@@ -67,18 +68,11 @@ const CALENDAR_TAGS: &[(u8, &str)] = &[
 ];
 
 /// Email (codepage 2) tags, [MS-ASWBXML] 2.1.2.3. Minimal field set for a
-/// readable message list (no attachments/MIME/meeting-request fields yet).
+/// readable message list. Attachments and the message body are carried
+/// through the real AirSyncBase codepage instead (`AIRSYNCBASE_TAGS`);
+/// this page's own deprecated pre-12.0 `Attachment`/`Attachments`/
+/// `AttName`/`AttSize`/`AttOid`/`AttMethod`/`Body` fields aren't used.
 const EMAIL_TAGS: &[(u8, &str)] = &[
-    // Deprecated in EAS 14.0+ (modern clients expect Attachments/Body
-    // under the AirSyncBase codepage instead, which this project doesn't
-    // model yet); kept here as the simplest way to carry this data for now.
-    (0x05, "Attachment"),
-    (0x06, "Attachments"),
-    (0x07, "AttName"),
-    (0x08, "AttSize"),
-    (0x09, "AttOid"),
-    (0x0A, "AttMethod"),
-    (0x0C, "Body"),
     (0x0F, "DateReceived"),
     (0x11, "DisplayTo"),
     (0x12, "Importance"),
@@ -158,20 +152,14 @@ const PROVISION_TAGS: &[(u8, &str)] = &[
 ];
 
 /// ItemOperations (codepage 20) tags, [MS-ASWBXML] 2.1.2.20. Cross-checked
-/// against the original PHP z-push's `wbxmldefs.php`: 0x05-0x0E here now
-/// match the real spec exactly. `ServerId`/`CollectionId` for a Fetch
-/// target really do come from the AirSync codepage (0) and are no longer
-/// self-contained here (see `AIRSYNC_TAGS`'s own 0x0D/0x12) -- a real
-/// device sends them there, so inventing a separate token for them on this
-/// page, as this project originally did, would have failed to decode a
-/// real device's request.
-///
-/// `FileReference`/`ContentType` are still self-contained placeholders:
-/// the real spec puts both under the AirSyncBase codepage (0x11), which
-/// this project doesn't implement (it still carries attachments/body
-/// through the deprecated Email-codepage fields, see `EMAIL_TAGS`'s own
-/// note). Fully fixing this means adding a real AirSyncBase codepage, not
-/// just a token number, so it's tracked as a known limitation instead.
+/// against the original PHP z-push's `wbxmldefs.php`: every token here now
+/// matches the real spec exactly. `ServerId`/`CollectionId` for a Fetch
+/// target, and `FileReference`/`ContentType`/`Data` for the fetched
+/// content itself, all come from other codepages a real device actually
+/// uses (AirSync and AirSyncBase respectively -- see `AIRSYNCBASE_TAGS`),
+/// not self-contained tokens on this page, which is what this project
+/// originally invented and which would have failed to decode a real
+/// device's request.
 const ITEMOPERATIONS_TAGS: &[(u8, &str)] = &[
     (0x05, "ItemOperations"),
     (0x06, "Fetch"),
@@ -181,8 +169,26 @@ const ITEMOPERATIONS_TAGS: &[(u8, &str)] = &[
     (0x0C, "Data"),
     (0x0D, "Status"),
     (0x0E, "Response"),
-    (0x12, "FileReference"),
-    (0x13, "ContentType"),
+];
+
+/// AirSyncBase (codepage 17) tags, [MS-ASWBXML] 2.1.2.17 (since EAS 12.0).
+/// Cross-checked against the original PHP z-push's `wbxmldefs.php`. This
+/// is the modern home for email bodies and attachments; this project used
+/// to carry both through the deprecated pre-12.0 Email-codepage fields
+/// (`EMAIL_TAGS`'s own `Attachment`/`Attachments`/`AttName`/.../`Body`),
+/// which a real device built against a current EAS client version won't
+/// look for. Minimal subset: no `BodyPart`/`Preview`/inline-body support.
+const AIRSYNCBASE_TAGS: &[(u8, &str)] = &[
+    (0x0A, "Body"),
+    (0x0B, "Data"),
+    (0x0C, "EstimatedDataSize"),
+    (0x0D, "Truncated"),
+    (0x0E, "Attachments"),
+    (0x0F, "Attachment"),
+    (0x10, "DisplayName"),
+    (0x11, "FileReference"),
+    (0x12, "Method"),
+    (0x17, "ContentType"),
 ];
 
 /// Move (codepage 5) tags, [MS-ASWBXML] 2.1.2.5. NOTE: like
@@ -359,6 +365,12 @@ pub fn itemoperations_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
 pub fn itemoperations_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
     build_encode_table(PAGE_ITEMOPERATIONS, ITEMOPERATIONS_TAGS)
 }
+pub fn airsyncbase_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
+    build_decode_table(PAGE_AIRSYNCBASE, AIRSYNCBASE_TAGS)
+}
+pub fn airsyncbase_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
+    build_encode_table(PAGE_AIRSYNCBASE, AIRSYNCBASE_TAGS)
+}
 pub fn ping_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
     build_decode_table(PAGE_PING, PING_TAGS)
 }
@@ -449,6 +461,7 @@ mod tests {
             (resolverecipients_decode_table(), resolverecipients_encode_table()),
             (search_decode_table(), search_encode_table()),
             (settings_decode_table(), settings_encode_table()),
+            (airsyncbase_decode_table(), airsyncbase_encode_table()),
         ] {
             for (page, tokens) in &decode {
                 let encode_page = &encode[page];

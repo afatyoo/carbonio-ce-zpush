@@ -2,14 +2,16 @@ use crate::activesync_http::{ensure_supported_command, parse_activesync_query, p
 use crate::carbonio::{CarbonioClient, FolderSyncOutcome, SyncOutcome};
 use crate::codepages::{
     activesync_folder_type, airsync_decode_table, airsync_encode_table, airsync_item_page_of,
-    calendar_encode_table, contacts_encode_table, email_encode_table, folderhierarchy_decode_table,
+    airsyncbase_decode_table, airsyncbase_encode_table, calendar_encode_table, contacts_encode_table,
+    email_encode_table, folderhierarchy_decode_table,
     folderhierarchy_encode_table, itemestimate_decode_table,
     itemestimate_encode_table, itemoperations_decode_table, itemoperations_encode_table,
     merge_decode_tables, merge_encode_tables, move_decode_table, move_encode_table, ping_decode_table,
     ping_encode_table, provision_encode_table, resolverecipients_decode_table, resolverecipients_encode_table,
     search_decode_table, search_encode_table, settings_decode_table, settings_encode_table,
-    PAGE_AIRSYNC, PAGE_CALENDAR, PAGE_CONTACTS, PAGE_EMAIL, PAGE_FOLDERHIERARCHY, PAGE_ITEMESTIMATE,
-    PAGE_ITEMOPERATIONS, PAGE_MOVE, PAGE_PING, PAGE_PROVISION, PAGE_RESOLVERECIPIENTS, PAGE_SEARCH, PAGE_SETTINGS,
+    PAGE_AIRSYNC, PAGE_AIRSYNCBASE, PAGE_CALENDAR, PAGE_CONTACTS, PAGE_EMAIL, PAGE_FOLDERHIERARCHY,
+    PAGE_ITEMESTIMATE, PAGE_ITEMOPERATIONS, PAGE_MOVE, PAGE_PING, PAGE_PROVISION, PAGE_RESOLVERECIPIENTS,
+    PAGE_SEARCH, PAGE_SETTINGS,
 };
 use crate::mime_lite::parse_rfc822;
 use crate::sync_state::SyncStateStore;
@@ -458,6 +460,14 @@ async fn handle_sync(
 /// `GetMsgRequest` round trip to list the attachment parts, so a device
 /// has a `FileReference` to `Fetch` later -- only paid for messages that
 /// actually have attachments, not every message in the folder.
+///
+/// Attachments are listed under the real AirSyncBase codepage
+/// (`DisplayName`/`FileReference`/`Method`/`EstimatedDataSize`/
+/// `ContentType`), cross-checked against the original PHP z-push's
+/// `wbxmldefs.php`: the old Email-codepage `Attachment`/`AttName`/
+/// `AttSize`/`AttOid`/`AttMethod` fields this project used before are
+/// deprecated since EAS 12.0, and a real device built against a current
+/// client version won't look for them there.
 async fn email_to_add_node(client: &CarbonioClient, m: &crate::carbonio::CarbonioMessage) -> WbxmlNode {
     let mut application_data = vec![
         WbxmlNode::Tag {
@@ -484,20 +494,24 @@ async fn email_to_add_node(client: &CarbonioClient, m: &crate::carbonio::Carboni
                         name: "Attachment".into(),
                         children: vec![
                             WbxmlNode::Tag {
-                                name: "AttName".into(),
+                                name: "DisplayName".into(),
                                 children: vec![WbxmlNode::Text(a.filename.clone())],
                             },
                             WbxmlNode::Tag {
-                                name: "AttSize".into(),
-                                children: vec![WbxmlNode::Text(a.size.to_string())],
-                            },
-                            WbxmlNode::Tag {
-                                name: "AttOid".into(),
+                                name: "FileReference".into(),
                                 children: vec![WbxmlNode::Text(format!("{}:{}", m.id, a.part_id))],
                             },
                             WbxmlNode::Tag {
-                                name: "AttMethod".into(),
+                                name: "Method".into(),
                                 children: vec![WbxmlNode::Text("1".into())],
+                            },
+                            WbxmlNode::Tag {
+                                name: "EstimatedDataSize".into(),
+                                children: vec![WbxmlNode::Text(a.size.to_string())],
+                            },
+                            WbxmlNode::Tag {
+                                name: "ContentType".into(),
+                                children: vec![WbxmlNode::Text(a.content_type.clone())],
                             },
                         ],
                     })
@@ -638,8 +652,26 @@ fn build_sync_response(
         }],
     }];
 
-    let encode_table = merge_encode_tables(vec![airsync_encode_table(), item_encode_table]);
-    let page_of = airsync_item_page_of(item_page);
+    let mut encode_table = merge_encode_tables(vec![airsync_encode_table(), item_encode_table]);
+    if matches!(kind, CollectionKind::Email) {
+        encode_table = merge_encode_tables(vec![encode_table, airsyncbase_encode_table()]);
+    }
+    let base_page_of = airsync_item_page_of(item_page);
+    // Email's attachment list lives under the real AirSyncBase codepage
+    // (cross-checked against the original PHP z-push), not the deprecated
+    // Email-codepage attachment fields this project used before.
+    let page_of = |name: &str| {
+        if matches!(kind, CollectionKind::Email)
+            && matches!(
+                name,
+                "Attachments" | "Attachment" | "DisplayName" | "FileReference" | "Method" | "EstimatedDataSize" | "ContentType"
+            )
+        {
+            PAGE_AIRSYNCBASE
+        } else {
+            base_page_of(name)
+        }
+    };
     let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &page_of) {
         Ok(bytes) => bytes,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
@@ -926,7 +958,7 @@ fn parse_attachment_file_reference(file_reference: &str) -> Option<(&str, &str)>
 }
 
 async fn handle_item_operations(client: &CarbonioClient, body: &[u8]) -> Response {
-    let decode_table = merge_decode_tables(vec![itemoperations_decode_table(), airsync_decode_table()]);
+    let decode_table = merge_decode_tables(vec![itemoperations_decode_table(), airsync_decode_table(), airsyncbase_decode_table()]);
     let nodes = match WbxmlDecoder::new(body, &decode_table).decode() {
         Ok(n) => n,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("failed to decode ItemOperations body: {e}")).into_response(),
@@ -1004,10 +1036,13 @@ async fn handle_item_operations(client: &CarbonioClient, body: &[u8]) -> Respons
         ],
     }];
 
-    let encode_table = merge_encode_tables(vec![itemoperations_encode_table(), email_encode_table(), airsync_encode_table()]);
+    // `Body` lives under the real AirSyncBase codepage (cross-checked
+    // against the original PHP z-push), not the deprecated Email-codepage
+    // `Body` this project used before.
+    let encode_table = merge_encode_tables(vec![itemoperations_encode_table(), airsyncbase_encode_table(), airsync_encode_table()]);
     let page_of = |name: &str| {
         if name == "Body" {
-            PAGE_EMAIL
+            PAGE_AIRSYNCBASE
         } else if name == "ServerId" {
             PAGE_AIRSYNC
         } else {
@@ -1075,8 +1110,19 @@ async fn handle_fetch_attachment(client: &CarbonioClient, file_reference: String
         ],
     }];
 
-    let encode_table = itemoperations_encode_table();
-    let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &|_name| PAGE_ITEMOPERATIONS) {
+    // `FileReference`/`ContentType`/`Data` all live under the real
+    // AirSyncBase codepage (cross-checked against the original PHP
+    // z-push), not self-contained `ItemOperations` tokens this project
+    // invented before.
+    let encode_table = merge_encode_tables(vec![itemoperations_encode_table(), airsyncbase_encode_table()]);
+    let page_of = |name: &str| {
+        if matches!(name, "FileReference" | "ContentType" | "Data") {
+            PAGE_AIRSYNCBASE
+        } else {
+            PAGE_ITEMOPERATIONS
+        }
+    };
+    let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &page_of) {
         Ok(bytes) => bytes,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
     };
