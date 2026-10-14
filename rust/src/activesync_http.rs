@@ -94,8 +94,19 @@ fn percent_decode(input: &str) -> String {
 /// currently implements, surfacing an explicit error for anything else
 /// rather than silently mis-dispatching.
 pub fn ensure_supported_command(command: &str) -> Result<()> {
-    const SUPPORTED: &[&str] =
-        &["FolderSync", "Sync", "Provision", "Ping", "SendMail", "GetItemEstimate", "ItemOperations"];
+    const SUPPORTED: &[&str] = &[
+        "FolderSync",
+        "Sync",
+        "Provision",
+        "Ping",
+        "SendMail",
+        "GetItemEstimate",
+        "ItemOperations",
+        "MoveItems",
+        "ResolveRecipients",
+        "Settings",
+        "Search",
+    ];
     if !SUPPORTED.contains(&command) {
         bail!("ActiveSync command '{command}' is not yet implemented");
     }
@@ -145,7 +156,7 @@ mod tests {
 
     #[test]
     fn unsupported_command_is_rejected() {
-        let err = ensure_supported_command("MoveItems").unwrap_err();
+        let err = ensure_supported_command("Settings2").unwrap_err();
         assert!(err.to_string().contains("not yet implemented"));
     }
 

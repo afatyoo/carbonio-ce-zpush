@@ -420,6 +420,177 @@ impl CarbonioClient {
         Ok(raw_messages.into_iter().map(RawMessage::into_carbonio_message).collect())
     }
 
+    /// Lists up to `limit` messages matching `free_text`, newest first, via
+    /// the same `SearchRequest` as `search_messages` but with the free text
+    /// as the query. When `folder_id` is given, the query is scoped to that
+    /// folder (`inid:<id> <text>`, since Zimbra's query language ANDs
+    /// space-separated terms together); `None` searches the whole mailbox,
+    /// matching MS-ASCMD's basic `Search` command (no per-folder scoping in
+    /// the request). Backs the `Search` command.
+    pub async fn search_messages_text(&self, folder_id: Option<&str>, free_text: &str, limit: u32) -> Result<Vec<CarbonioMessage>> {
+        let token = self
+            .auth_token
+            .as_deref()
+            .context("search_messages_text called before authenticate")?;
+
+        let query = match folder_id {
+            Some(id) => format!("inid:{id} {free_text}"),
+            None => free_text.to_string(),
+        };
+        let request_body = json!({
+            "Body": {
+                "SearchRequest": {
+                    "_jsns": "urn:zimbraMail",
+                    "types": "message",
+                    "query": { "_content": query },
+                    "sortBy": "dateDesc",
+                    "limit": limit
+                }
+            },
+            "Header": {
+                "context": {
+                    "_jsns": "urn:zimbra",
+                    "authToken": { "_content": token }
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("SearchRequest (text) failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<SearchBody> = response
+            .json()
+            .await
+            .context("SearchRequest (text) response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault
+                .detail
+                .map(|d| d.error.code)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio SearchRequest (text) failed ({code}): {}", fault.reason.text);
+        }
+
+        let raw_messages = envelope
+            .body
+            .search_response
+            .context("SearchResponse missing from a non-fault SOAP reply")?
+            .m;
+
+        Ok(raw_messages.into_iter().map(RawMessage::into_carbonio_message).collect())
+    }
+
+    /// Moves an item (any type: message, contact, appointment) to a
+    /// different folder via `ItemActionRequest` (`urn:zimbraMail`) with
+    /// `op=move`. Verified live: the item keeps its own id across the move
+    /// (Carbonio does not renumber it), so this backs `MoveItems` by moving
+    /// the item and reporting the same id back as both source and
+    /// destination id.
+    pub async fn move_item(&self, item_id: &str, dst_folder_id: &str) -> Result<()> {
+        let token = self.auth_token.as_deref().context("move_item called before authenticate")?;
+
+        let request_body = json!({
+            "Body": {
+                "ItemActionRequest": {
+                    "_jsns": "urn:zimbraMail",
+                    "action": { "op": "move", "id": item_id, "l": dst_folder_id }
+                }
+            },
+            "Header": {
+                "context": {
+                    "_jsns": "urn:zimbra",
+                    "authToken": { "_content": token }
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("ItemActionRequest failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<ItemActionBody> = response
+            .json()
+            .await
+            .context("ItemActionRequest response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault
+                .detail
+                .map(|d| d.error.code)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio ItemActionRequest failed ({code}): {}", fault.reason.text);
+        }
+
+        Ok(())
+    }
+
+    /// Looks up `address` in Carbonio's Global Address List via
+    /// `SearchGalRequest` (`urn:zimbraAccount`), for `ResolveRecipients`.
+    /// Returns the GAL entry's display name if found; `None` if there is no
+    /// matching GAL entry (the caller falls back to treating the address as
+    /// already fully resolved, since it's typed by the user and syntactically
+    /// a valid address either way).
+    pub async fn resolve_recipient(&self, address: &str) -> Result<Option<String>> {
+        let token = self.auth_token.as_deref().context("resolve_recipient called before authenticate")?;
+
+        let request_body = json!({
+            "Body": {
+                "SearchGalRequest": {
+                    "_jsns": "urn:zimbraAccount",
+                    "name": address,
+                    "type": "account"
+                }
+            },
+            "Header": {
+                "context": {
+                    "_jsns": "urn:zimbra",
+                    "authToken": { "_content": token }
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("SearchGalRequest failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<SearchGalBody> = response
+            .json()
+            .await
+            .context("SearchGalRequest response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault
+                .detail
+                .map(|d| d.error.code)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio SearchGalRequest failed ({code}): {}", fault.reason.text);
+        }
+
+        let display_name = envelope
+            .body
+            .search_gal_response
+            .and_then(|r| r.cn.into_iter().next())
+            .map(|cn| cn.file_as_str);
+
+        Ok(display_name)
+    }
+
     /// Sends an email via `SendMsgRequest` (`urn:zimbraMail`), with an
     /// optional HTML alternative body and optional attachments (already
     /// uploaded via [`Self::upload_attachment`]).
@@ -645,6 +816,122 @@ impl CarbonioClient {
             .appt;
 
         Ok(raw_appts.into_iter().map(RawAppointment::into_carbonio_appointment).collect())
+    }
+
+    /// Fetches a single contact's full attribute set via `GetContactsRequest`
+    /// (`urn:zimbraMail`), for `ItemOperations`/`Fetch` on a Contacts item.
+    /// Verified live: `cn` comes back as a one-element array with the same
+    /// `_attrs` shape `search_contacts` already parses, so this reuses
+    /// `RawContact`.
+    pub async fn get_contact(&self, contact_id: &str) -> Result<CarbonioContact> {
+        let token = self.auth_token.as_deref().context("get_contact called before authenticate")?;
+
+        let request_body = json!({
+            "Body": {
+                "GetContactsRequest": {
+                    "_jsns": "urn:zimbraMail",
+                    "cn": { "id": contact_id }
+                }
+            },
+            "Header": {
+                "context": {
+                    "_jsns": "urn:zimbra",
+                    "authToken": { "_content": token }
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("GetContactsRequest failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<GetContactsBody> = response
+            .json()
+            .await
+            .context("GetContactsRequest response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault
+                .detail
+                .map(|d| d.error.code)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio GetContactsRequest failed ({code}): {}", fault.reason.text);
+        }
+
+        let contact = envelope
+            .body
+            .get_contacts_response
+            .context("GetContactsResponse missing from a non-fault SOAP reply")?
+            .cn
+            .into_iter()
+            .next()
+            .context("GetContactsResponse had no matching contact")?;
+
+        Ok(contact.into_carbonio_contact())
+    }
+
+    /// Fetches a single calendar event's full detail via
+    /// `GetAppointmentRequest` (`urn:zimbraMail`), for `ItemOperations`/
+    /// `Fetch` on a Calendar item. Verified live: unlike `SearchRequest`'s
+    /// flat `name`/`loc`/`dur`/`inst` fields, this response nests the usable
+    /// fields under `appt[0].inv[0].comp[0]` (invite/component), which is
+    /// why this needs its own raw struct instead of reusing `RawAppointment`.
+    pub async fn get_appointment(&self, appointment_id: &str) -> Result<CarbonioAppointment> {
+        let token = self.auth_token.as_deref().context("get_appointment called before authenticate")?;
+
+        let request_body = json!({
+            "Body": {
+                "GetAppointmentRequest": {
+                    "_jsns": "urn:zimbraMail",
+                    "id": appointment_id
+                }
+            },
+            "Header": {
+                "context": {
+                    "_jsns": "urn:zimbra",
+                    "authToken": { "_content": token }
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("GetAppointmentRequest failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<GetAppointmentBody> = response
+            .json()
+            .await
+            .context("GetAppointmentRequest response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault
+                .detail
+                .map(|d| d.error.code)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio GetAppointmentRequest failed ({code}): {}", fault.reason.text);
+        }
+
+        let raw = envelope
+            .body
+            .get_appointment_response
+            .context("GetAppointmentResponse missing from a non-fault SOAP reply")?
+            .appt
+            .into_iter()
+            .next()
+            .context("GetAppointmentResponse had no matching appointment")?;
+
+        raw.into_carbonio_appointment()
+            .context("GetAppointmentResponse's appt had no invite/component data")
     }
 
     /// Fetches a message's plain-text body and attachment list via
@@ -1047,6 +1334,35 @@ pub struct MessageDetails {
     pub attachments: Vec<AttachmentRef>,
 }
 
+/// `ItemActionResponse`'s own `action` echo isn't used for anything (its
+/// `id` is the same id we sent); only whether a `Fault` came back matters.
+#[derive(Debug, Deserialize)]
+struct ItemActionBody {
+    #[serde(rename = "Fault")]
+    fault: Option<SoapFault>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchGalBody {
+    #[serde(rename = "SearchGalResponse")]
+    search_gal_response: Option<SearchGalResponse>,
+    #[serde(rename = "Fault")]
+    fault: Option<SoapFault>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchGalResponse {
+    #[serde(default)]
+    cn: Vec<RawGalContact>,
+}
+
+/// A GAL entry, trimmed to the one field `resolve_recipient` needs.
+#[derive(Debug, Deserialize)]
+struct RawGalContact {
+    #[serde(rename = "fileAsStr")]
+    file_as_str: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct SendMsgBody {
     #[serde(rename = "Fault")]
@@ -1115,6 +1431,73 @@ impl RawAppointment {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct GetAppointmentBody {
+    #[serde(rename = "GetAppointmentResponse")]
+    get_appointment_response: Option<GetAppointmentResponse>,
+    #[serde(rename = "Fault")]
+    fault: Option<SoapFault>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetAppointmentResponse {
+    #[serde(default)]
+    appt: Vec<RawApptDetail>,
+}
+
+/// A single `GetAppointmentRequest` result. The fields a Calendar `Fetch`
+/// needs (subject, location, start/end time, all-day flag) live under the
+/// first invite's first component, not at this level.
+#[derive(Debug, Deserialize)]
+struct RawApptDetail {
+    id: String,
+    #[serde(default)]
+    inv: Vec<RawInvite>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawInvite {
+    #[serde(default)]
+    comp: Vec<RawComponent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawComponent {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    loc: String,
+    #[serde(default, rename = "allDay")]
+    all_day: bool,
+    #[serde(default)]
+    s: Vec<RawCompTime>,
+    #[serde(default)]
+    e: Vec<RawCompTime>,
+}
+
+/// A component's start/end time; `u` is milliseconds since the Unix epoch
+/// (the same unit `inst[].s` uses for search results).
+#[derive(Debug, Deserialize)]
+struct RawCompTime {
+    u: i64,
+}
+
+impl RawApptDetail {
+    fn into_carbonio_appointment(self) -> Option<CarbonioAppointment> {
+        let comp = self.inv.into_iter().next()?.comp.into_iter().next()?;
+        let start_epoch_ms = comp.s.first().map(|t| t.u).unwrap_or(0);
+        let end_epoch_ms = comp.e.first().map(|t| t.u).unwrap_or(start_epoch_ms);
+        Some(CarbonioAppointment {
+            id: self.id,
+            subject: comp.name,
+            location: comp.loc,
+            start_epoch_ms,
+            end_epoch_ms,
+            all_day: comp.all_day,
+        })
+    }
+}
+
 /// One contact, trimmed to the fields the Contacts codepage currently emits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CarbonioContact {
@@ -1137,6 +1520,14 @@ struct SearchContactsBody {
 struct SearchContactsResponse {
     #[serde(default)]
     cn: Vec<RawContact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetContactsBody {
+    #[serde(rename = "GetContactsResponse")]
+    get_contacts_response: Option<SearchContactsResponse>,
+    #[serde(rename = "Fault")]
+    fault: Option<SoapFault>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1483,6 +1874,139 @@ mod tests {
             raw_appts.into_iter().map(RawAppointment::into_carbonio_appointment).collect();
         assert_eq!(appointments[0].start_epoch_ms, 0);
         assert_eq!(appointments[0].end_epoch_ms, 1000);
+    }
+
+    #[test]
+    fn get_contacts_response_maps_known_attrs() {
+        // Shape matches a real GetContactsRequest hit, captured live from
+        // Carbonio CE (carbonio-core 4.5.14): `cn` is a one-element array
+        // with the same `_attrs` shape SearchRequest uses.
+        let raw = r#"{
+            "Body": {
+                "GetContactsResponse": {
+                    "cn": [{
+                        "id": "262",
+                        "l": "7",
+                        "fileAsStr": "Santoso, Budi",
+                        "_attrs": {
+                            "firstName": "Budi",
+                            "lastName": "Santoso",
+                            "mobilePhone": "08123456789",
+                            "email": "budi@afatyo.com"
+                        }
+                    }]
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<GetContactsBody> = serde_json::from_str(raw).unwrap();
+        let contact = envelope.body.get_contacts_response.unwrap().cn.into_iter().next().unwrap();
+        assert_eq!(
+            contact.into_carbonio_contact(),
+            CarbonioContact {
+                id: "262".into(),
+                first_name: "Budi".into(),
+                last_name: "Santoso".into(),
+                email: "budi@afatyo.com".into(),
+                mobile_phone: "08123456789".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn get_appointment_response_extracts_subject_location_and_times_from_the_invite() {
+        // Shape matches a real GetAppointmentRequest hit, captured live from
+        // Carbonio CE (carbonio-core 4.5.14): unlike SearchRequest, the
+        // usable fields are nested under appt[0].inv[0].comp[0], not at the
+        // appt level.
+        let raw = r#"{
+            "Body": {
+                "GetAppointmentResponse": {
+                    "appt": [{
+                        "id": "264",
+                        "inv": [{
+                            "comp": [{
+                                "name": "Team Sync Meeting",
+                                "loc": "Zoom",
+                                "s": [{"d": "20261020T090000", "tz": "America/Los_Angeles", "u": 1792512000000}],
+                                "e": [{"tz": "America/Los_Angeles", "u": 1792515600000, "d": "20261020T100000"}]
+                            }]
+                        }]
+                    }]
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<GetAppointmentBody> = serde_json::from_str(raw).unwrap();
+        let raw_appt = envelope.body.get_appointment_response.unwrap().appt.into_iter().next().unwrap();
+        let appt = raw_appt.into_carbonio_appointment().expect("invite/component data should be present");
+        assert_eq!(appt.id, "264");
+        assert_eq!(appt.subject, "Team Sync Meeting");
+        assert_eq!(appt.location, "Zoom");
+        assert_eq!(appt.start_epoch_ms, 1792512000000);
+        assert_eq!(appt.end_epoch_ms, 1792515600000);
+        assert!(!appt.all_day);
+    }
+
+    #[test]
+    fn get_appointment_response_with_no_invite_returns_none() {
+        let raw = r#"{
+            "Body": {
+                "GetAppointmentResponse": { "appt": [{"id": "264"}] }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<GetAppointmentBody> = serde_json::from_str(raw).unwrap();
+        let raw_appt = envelope.body.get_appointment_response.unwrap().appt.into_iter().next().unwrap();
+        assert!(raw_appt.into_carbonio_appointment().is_none());
+    }
+
+    #[test]
+    fn item_action_response_with_no_fault_is_success() {
+        // Shape matches a real move hit, captured live from Carbonio CE
+        // (carbonio-core 4.5.14): moving a message doesn't renumber it.
+        let raw = r#"{
+            "Body": {
+                "ItemActionResponse": { "action": {"id": "275", "op": "move"} }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<ItemActionBody> = serde_json::from_str(raw).unwrap();
+        assert!(envelope.body.fault.is_none());
+    }
+
+    #[test]
+    fn search_gal_response_extracts_the_display_name() {
+        // Shape matches a real SearchGalRequest hit, captured live from
+        // Carbonio CE (carbonio-core 4.5.14): `cn` uses the same `_attrs`
+        // convention as contacts, but `resolve_recipient` only needs
+        // `fileAsStr`.
+        let raw = r#"{
+            "Body": {
+                "SearchGalResponse": {
+                    "cn": [{
+                        "id": "x:258",
+                        "fileAsStr": "Carbonio Admin",
+                        "_attrs": {"email": "zextras@afatyo.com"}
+                    }]
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<SearchGalBody> = serde_json::from_str(raw).unwrap();
+        let display_name = envelope.body.search_gal_response.and_then(|r| r.cn.into_iter().next()).map(|cn| cn.file_as_str);
+        assert_eq!(display_name, Some("Carbonio Admin".to_string()));
+    }
+
+    #[test]
+    fn search_gal_response_with_no_matches_is_none() {
+        let raw = r#"{
+            "Body": { "SearchGalResponse": {} },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<SearchGalBody> = serde_json::from_str(raw).unwrap();
+        let display_name = envelope.body.search_gal_response.and_then(|r| r.cn.into_iter().next()).map(|cn| cn.file_as_str);
+        assert_eq!(display_name, None);
     }
 
     #[test]

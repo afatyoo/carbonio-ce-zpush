@@ -9,9 +9,13 @@ pub const PAGE_EMAIL: u8 = 0x02;
 pub const PAGE_CALENDAR: u8 = 0x04;
 pub const PAGE_FOLDERHIERARCHY: u8 = 0x07;
 pub const PAGE_ITEMESTIMATE: u8 = 0x06;
+pub const PAGE_MOVE: u8 = 0x05;
+pub const PAGE_RESOLVERECIPIENTS: u8 = 0x0A;
+pub const PAGE_SEARCH: u8 = 0x0F;
 pub const PAGE_PING: u8 = 0x0D;
 pub const PAGE_PROVISION: u8 = 0x0E;
 pub const PAGE_ITEMOPERATIONS: u8 = 0x14;
+pub const PAGE_SETTINGS: u8 = 0x12;
 
 /// AirSync (codepage 0) tags, [MS-ASWBXML] 2.1.2.1. Only the subset this
 /// server currently emits/consumes for FolderSync and item Sync.
@@ -179,6 +183,67 @@ const ITEMOPERATIONS_TAGS: &[(u8, &str)] = &[
     (0x13, "ContentType"),
 ];
 
+/// Move (codepage 5) tags, [MS-ASWBXML] 2.1.2.5. NOTE: like
+/// `ITEMESTIMATE_TAGS`, reproduced from memory and not re-checked against
+/// the published spec text or a real device.
+const MOVE_TAGS: &[(u8, &str)] = &[
+    (0x05, "MoveItems"),
+    (0x06, "Move"),
+    (0x07, "SrcMsgId"),
+    (0x08, "SrcFldId"),
+    (0x09, "DstFldId"),
+    (0x0A, "Response"),
+    (0x0B, "Status"),
+    (0x0C, "DstMsgId"),
+];
+
+/// ResolveRecipients (codepage 10) tags, [MS-ASWBXML] 2.1.2.10. Minimal
+/// subset: no certificate or picture support. Same unverified-against-spec
+/// caveat as `ITEMESTIMATE_TAGS`. `To` (the request's address list) is not
+/// part of the official codepage (the spec nests it differently); kept
+/// self-contained here the same way `ITEMOPERATIONS_TAGS` does for
+/// `FileReference`.
+const RESOLVERECIPIENTS_TAGS: &[(u8, &str)] = &[
+    (0x05, "ResolveRecipients"),
+    (0x06, "Response"),
+    (0x07, "Status"),
+    (0x09, "Recipient"),
+    (0x0A, "DisplayName"),
+    (0x0B, "EmailAddress"),
+    (0x13, "To"),
+];
+
+/// Search (codepage 15) tags, [MS-ASWBXML] 2.1.2.15. Minimal subset: one
+/// flat free-text query against a single mailbox collection, no boolean
+/// query trees (`And`/`Or`/`LessThan`/etc.), no GAL search. Same
+/// unverified-against-spec caveat as `ITEMESTIMATE_TAGS`.
+const SEARCH_TAGS: &[(u8, &str)] = &[
+    (0x05, "Search"),
+    (0x07, "Store"),
+    (0x08, "Name"),
+    (0x09, "Query"),
+    (0x0B, "Range"),
+    (0x0C, "Status"),
+    (0x0D, "Response"),
+    (0x0E, "Result"),
+    (0x10, "Total"),
+];
+
+/// Settings (codepage 18) tags, [MS-ASWBXML] 2.1.2.18. Minimal subset: just
+/// enough to accept a `DeviceInformation` `Set` and answer an `Oof` `Get`
+/// with "out of office is off". No real per-device settings storage, no
+/// Oof message editing. Same unverified-against-spec caveat as
+/// `ITEMESTIMATE_TAGS`.
+const SETTINGS_TAGS: &[(u8, &str)] = &[
+    (0x05, "Settings"),
+    (0x06, "Status"),
+    (0x07, "Get"),
+    (0x08, "Set"),
+    (0x09, "Oof"),
+    (0x0A, "OofState"),
+    (0x0D, "DeviceInformation"),
+];
+
 /// ActiveSync folder type codes (MS-ASCMD 2.2.3.165.1) for the Carbonio/Zimbra
 /// folder "view" attribute values we map to a FolderSync `<Type>`.
 pub mod folder_type {
@@ -298,6 +363,30 @@ pub fn provision_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
 pub fn provision_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
     build_encode_table(PAGE_PROVISION, PROVISION_TAGS)
 }
+pub fn move_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
+    build_decode_table(PAGE_MOVE, MOVE_TAGS)
+}
+pub fn move_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
+    build_encode_table(PAGE_MOVE, MOVE_TAGS)
+}
+pub fn resolverecipients_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
+    build_decode_table(PAGE_RESOLVERECIPIENTS, RESOLVERECIPIENTS_TAGS)
+}
+pub fn resolverecipients_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
+    build_encode_table(PAGE_RESOLVERECIPIENTS, RESOLVERECIPIENTS_TAGS)
+}
+pub fn search_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
+    build_decode_table(PAGE_SEARCH, SEARCH_TAGS)
+}
+pub fn search_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
+    build_encode_table(PAGE_SEARCH, SEARCH_TAGS)
+}
+pub fn settings_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
+    build_decode_table(PAGE_SETTINGS, SETTINGS_TAGS)
+}
+pub fn settings_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
+    build_encode_table(PAGE_SETTINGS, SETTINGS_TAGS)
+}
 
 /// Looks up which codepage a tag name belongs to, across the AirSync table
 /// and one item-type table (Email or Contacts) -- the combination a `Sync`
@@ -348,6 +437,10 @@ mod tests {
             (itemoperations_decode_table(), itemoperations_encode_table()),
             (ping_decode_table(), ping_encode_table()),
             (provision_decode_table(), provision_encode_table()),
+            (move_decode_table(), move_encode_table()),
+            (resolverecipients_decode_table(), resolverecipients_encode_table()),
+            (search_decode_table(), search_encode_table()),
+            (settings_decode_table(), settings_encode_table()),
         ] {
             for (page, tokens) in &decode {
                 let encode_page = &encode[page];

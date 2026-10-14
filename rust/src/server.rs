@@ -2,10 +2,14 @@ use crate::activesync_http::{ensure_supported_command, parse_activesync_query, p
 use crate::carbonio::CarbonioClient;
 use crate::codepages::{
     activesync_folder_type, airsync_encode_table, airsync_item_page_of, calendar_encode_table,
-    contacts_encode_table, email_encode_table, folderhierarchy_encode_table, itemestimate_decode_table,
+    contacts_encode_table, email_encode_table, folderhierarchy_decode_table, folderhierarchy_encode_table,
+    itemestimate_decode_table,
     itemestimate_encode_table, itemoperations_decode_table, itemoperations_encode_table,
-    merge_encode_tables, ping_encode_table, provision_encode_table, PAGE_CALENDAR, PAGE_CONTACTS,
-    PAGE_EMAIL, PAGE_FOLDERHIERARCHY, PAGE_ITEMESTIMATE, PAGE_ITEMOPERATIONS, PAGE_PING, PAGE_PROVISION,
+    merge_encode_tables, move_decode_table, move_encode_table, ping_decode_table, ping_encode_table,
+    provision_encode_table, resolverecipients_decode_table, resolverecipients_encode_table,
+    search_decode_table, search_encode_table, settings_decode_table, settings_encode_table,
+    PAGE_AIRSYNC, PAGE_CALENDAR, PAGE_CONTACTS, PAGE_EMAIL, PAGE_FOLDERHIERARCHY, PAGE_ITEMESTIMATE,
+    PAGE_ITEMOPERATIONS, PAGE_MOVE, PAGE_PING, PAGE_PROVISION, PAGE_RESOLVERECIPIENTS, PAGE_SEARCH, PAGE_SETTINGS,
 };
 use crate::mime_lite::parse_rfc822;
 use crate::sync_state::SyncStateStore;
@@ -115,13 +119,17 @@ async fn handle_activesync(
     }
 
     match request.command.as_str() {
-        "FolderSync" => handle_folder_sync(&mut client).await,
+        "FolderSync" => handle_folder_sync(&mut client, &state.sync_state, &request, &body).await,
         "Sync" => handle_sync(&mut client, &state.sync_state, &request, &body).await,
         "Provision" => handle_provision(),
-        "Ping" => handle_ping(&client).await,
+        "Ping" => handle_ping(&client, &body).await,
         "SendMail" => handle_send_mail(&client, &body).await,
         "GetItemEstimate" => handle_get_item_estimate(&client, &body).await,
         "ItemOperations" => handle_item_operations(&client, &body).await,
+        "MoveItems" => handle_move_items(&client, &body).await,
+        "ResolveRecipients" => handle_resolve_recipients(&client, &body).await,
+        "Settings" => handle_settings(&body),
+        "Search" => handle_search(&client, &body).await,
         other => (
             StatusCode::NOT_IMPLEMENTED,
             format!("'{other}' is accepted but not yet wired to a Carbonio handler"),
@@ -130,10 +138,42 @@ async fn handle_activesync(
     }
 }
 
-/// Builds a minimal FolderSync response: every Carbonio folder as an `<Add>`
-/// entry, SyncKey hardcoded to "1". Incremental sync (tracking a real
-/// SyncKey across requests so only deltas are sent) lands in a later task.
-async fn handle_folder_sync(client: &mut CarbonioClient) -> Response {
+/// There is only one folder hierarchy per account, so its SyncKey is tracked
+/// under this fixed sentinel "collection id" in the same per-(user, device)
+/// `SyncStateStore` the `Sync` command uses for real collections.
+const FOLDER_HIERARCHY_COLLECTION: &str = "__folder_hierarchy__";
+
+/// Builds a FolderSync response: every Carbonio folder as an `<Add>` entry.
+/// SyncKey handling mirrors the `Sync` command's own state machine:
+/// - client sends "0": full folder list, assign and return a new key.
+/// - client sends the store's current key: already caught up, so this
+///   returns zero changes (not true delta sync; a folder added or renamed
+///   since the last FolderSync is not detected until the device issues
+///   another "0").
+/// - client sends anything else (stale/unknown key): Status 9 (invalid sync
+///   key per MS-ASCMD 2.2.3.165.3), telling the device to FolderSync again
+///   from scratch.
+async fn handle_folder_sync(
+    client: &mut CarbonioClient,
+    sync_state: &SyncStateStore,
+    request: &ActiveSyncRequest,
+    body: &[u8],
+) -> Response {
+    let decode_table = folderhierarchy_decode_table();
+    let nodes = match WbxmlDecoder::new(body, &decode_table).decode() {
+        Ok(n) => n,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("failed to decode FolderSync body: {e}")).into_response(),
+    };
+    let client_sync_key = find_text_child(&nodes, "SyncKey").unwrap_or_else(|| "0".to_string());
+    let current_key = sync_state.current_key(&request.user, &request.device_id, FOLDER_HIERARCHY_COLLECTION);
+
+    if client_sync_key != "0" {
+        if client_sync_key != current_key {
+            return build_folder_sync_response("9", &current_key, Vec::new());
+        }
+        return build_folder_sync_response("1", &current_key, Vec::new());
+    }
+
     let folders = match client.get_folders().await {
         Ok(f) => f,
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("GetFolder from Carbonio failed: {e}")).into_response(),
@@ -165,9 +205,14 @@ async fn handle_folder_sync(client: &mut CarbonioClient) -> Response {
         });
     }
 
+    let new_key = sync_state.advance_key(&request.user, &request.device_id, FOLDER_HIERARCHY_COLLECTION);
+    build_folder_sync_response("1", &new_key, adds)
+}
+
+fn build_folder_sync_response(status: &str, sync_key: &str, adds: Vec<WbxmlNode>) -> Response {
     let mut changes_children = vec![WbxmlNode::Tag {
         name: "Count".into(),
-        children: vec![WbxmlNode::Text(folders.len().to_string())],
+        children: vec![WbxmlNode::Text(adds.len().to_string())],
     }];
     changes_children.extend(adds);
 
@@ -176,11 +221,11 @@ async fn handle_folder_sync(client: &mut CarbonioClient) -> Response {
         children: vec![
             WbxmlNode::Tag {
                 name: "Status".into(),
-                children: vec![WbxmlNode::Text("1".into())],
+                children: vec![WbxmlNode::Text(status.into())],
             },
             WbxmlNode::Tag {
                 name: "SyncKey".into(),
-                children: vec![WbxmlNode::Text("1".into())],
+                children: vec![WbxmlNode::Text(sync_key.into())],
             },
             WbxmlNode::Tag {
                 name: "Changes".into(),
@@ -565,13 +610,27 @@ fn handle_provision() -> Response {
 /// same as it would with any `Ping` implementation once this one's single
 /// wait window elapses.
 ///
-/// Status 2 ("changes found") is returned on any detected change without
-/// identifying which folder changed (`Folders`/`Folder` is omitted): the
-/// WaitSet response only reports that the account changed, not which
-/// collection, so this is a real but incomplete signal -- a real device
-/// reading status 2 with no folder list is outside what MS-ASCMD 2.2.3.3
-/// documents, and has not been tested against a real client.
-async fn handle_ping(client: &CarbonioClient) -> Response {
+/// Status 2 ("changes found") is returned on any detected change. Carbonio's
+/// WaitSet only reports that the account changed, not which collection
+/// (confirmed live: a `WaitSetResponse.a[]` entry is just `{id, changeid}`,
+/// no folder breakdown), so this can't tell the device which of its watched
+/// folders actually has new data. The practical compromise: the device's
+/// own `Ping` request already lists which folders it's watching
+/// (`Folders`/`Folder`/`Id`/`Class`), so on Status 2 this echoes that same
+/// list back, same as every watched folder changed. That's the device's own
+/// list, so it's always a safe superset to re-`Sync`, even though it isn't
+/// Carbonio telling us which one really changed.
+async fn handle_ping(client: &CarbonioClient, body: &[u8]) -> Response {
+    let watched_folders = if body.is_empty() {
+        Vec::new()
+    } else {
+        let decode_table = ping_decode_table();
+        match WbxmlDecoder::new(body, &decode_table).decode() {
+            Ok(nodes) => collect_ping_folders(&nodes),
+            Err(_) => Vec::new(),
+        }
+    };
+
     let (wait_set_id, seq) = match client.create_waitset().await {
         Ok(ids) => ids,
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("CreateWaitSetRequest to Carbonio failed: {e}")).into_response(),
@@ -582,13 +641,25 @@ async fn handle_ping(client: &CarbonioClient) -> Response {
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("WaitSetRequest to Carbonio failed: {e}")).into_response(),
     };
 
-    let tree = vec![WbxmlNode::Tag {
-        name: "Ping".into(),
-        children: vec![WbxmlNode::Tag {
-            name: "Status".into(),
-            children: vec![WbxmlNode::Text(if changed { "2" } else { "1" }.into())],
-        }],
+    let mut ping_children = vec![WbxmlNode::Tag {
+        name: "Status".into(),
+        children: vec![WbxmlNode::Text(if changed { "2" } else { "1" }.into())],
     }];
+    if changed && !watched_folders.is_empty() {
+        let folder_nodes = watched_folders
+            .into_iter()
+            .map(|(id, class)| WbxmlNode::Tag {
+                name: "Folder".into(),
+                children: vec![
+                    WbxmlNode::Tag { name: "Id".into(), children: vec![WbxmlNode::Text(id)] },
+                    WbxmlNode::Tag { name: "Class".into(), children: vec![WbxmlNode::Text(class)] },
+                ],
+            })
+            .collect();
+        ping_children.push(WbxmlNode::Tag { name: "Folders".into(), children: folder_nodes });
+    }
+
+    let tree = vec![WbxmlNode::Tag { name: "Ping".into(), children: ping_children }];
 
     let encode_table = ping_encode_table();
     let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &|_name| PAGE_PING) {
@@ -596,6 +667,41 @@ async fn handle_ping(client: &CarbonioClient) -> Response {
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
     };
     (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
+}
+
+/// Finds the first `<tag_name>` node in a decoded WBXML tree and returns its
+/// children, searching recursively (like `find_text_child`, but for a tag
+/// whose content is more child tags, not plain text).
+fn find_tag_children<'a>(nodes: &'a [WbxmlNode], tag_name: &str) -> Option<&'a [WbxmlNode]> {
+    for node in nodes {
+        if let WbxmlNode::Tag { name, children } = node {
+            if name == tag_name {
+                return Some(children);
+            }
+            if let Some(found) = find_tag_children(children, tag_name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Pulls the `(Id, Class)` pairs out of a `Ping` request's `Folders` list,
+/// so `handle_ping` can echo them back on Status 2.
+fn collect_ping_folders(nodes: &[WbxmlNode]) -> Vec<(String, String)> {
+    let Some(folders) = find_tag_children(nodes, "Folders") else { return Vec::new() };
+    folders
+        .iter()
+        .filter_map(|node| {
+            let WbxmlNode::Tag { name, children } = node else { return None };
+            if name != "Folder" {
+                return None;
+            }
+            let id = find_text_child(children, "Id")?;
+            let class = find_text_child(children, "Class").unwrap_or_else(|| "Email".to_string());
+            Some((id, class))
+        })
+        .collect()
 }
 
 /// Handles `GetItemEstimate`: reports how many items are in the requested
@@ -685,6 +791,31 @@ async fn handle_item_operations(client: &CarbonioClient, body: &[u8]) -> Respons
         Some(id) => id,
         None => return (StatusCode::BAD_REQUEST, "ItemOperations Fetch missing ServerId/FileReference").into_response(),
     };
+
+    // `CollectionId` tells us which item type `ServerId` belongs to, the
+    // same way `Sync` picks email vs. contacts vs. calendar per collection.
+    // Without it (some clients omit it on a Fetch), this falls back to the
+    // email body fetch below.
+    let kind = match find_text_child(&nodes, "CollectionId") {
+        Some(collection_id) => {
+            let folders = match client.get_folders().await {
+                Ok(f) => f,
+                Err(e) => return (StatusCode::BAD_GATEWAY, format!("GetFolder from Carbonio failed: {e}")).into_response(),
+            };
+            folders
+                .iter()
+                .find(|f| f.id == collection_id)
+                .and_then(|f| f.view.as_deref())
+                .map(|v| v.to_string())
+        }
+        None => None,
+    };
+
+    match kind.as_deref() {
+        Some("contact") => return handle_fetch_contact(client, server_id).await,
+        Some("appointment") => return handle_fetch_appointment(client, server_id).await,
+        _ => {}
+    }
 
     let details = match client.get_message_details(&server_id).await {
         Ok(d) => d,
@@ -795,6 +926,152 @@ async fn handle_fetch_attachment(client: &CarbonioClient, file_reference: String
     (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
 }
 
+/// Handles a Contacts `Fetch`: returns the contact's full field set under
+/// `Properties`, using the same field tags `Sync` already emits for
+/// contacts (`contact_to_add_node`).
+async fn handle_fetch_contact(client: &CarbonioClient, server_id: String) -> Response {
+    let contact = match client.get_contact(&server_id).await {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("GetContacts from Carbonio failed: {e}")).into_response(),
+    };
+
+    let tree = vec![WbxmlNode::Tag {
+        name: "ItemOperations".into(),
+        children: vec![
+            WbxmlNode::Tag {
+                name: "Status".into(),
+                children: vec![WbxmlNode::Text("1".into())],
+            },
+            WbxmlNode::Tag {
+                name: "Response".into(),
+                children: vec![WbxmlNode::Tag {
+                    name: "Fetch".into(),
+                    children: vec![
+                        WbxmlNode::Tag {
+                            name: "Status".into(),
+                            children: vec![WbxmlNode::Text("1".into())],
+                        },
+                        WbxmlNode::Tag {
+                            name: "ServerId".into(),
+                            children: vec![WbxmlNode::Text(server_id)],
+                        },
+                        WbxmlNode::Tag {
+                            name: "Properties".into(),
+                            children: vec![
+                                WbxmlNode::Tag {
+                                    name: "FirstName".into(),
+                                    children: vec![WbxmlNode::Text(contact.first_name)],
+                                },
+                                WbxmlNode::Tag {
+                                    name: "LastName".into(),
+                                    children: vec![WbxmlNode::Text(contact.last_name)],
+                                },
+                                WbxmlNode::Tag {
+                                    name: "Email1Address".into(),
+                                    children: vec![WbxmlNode::Text(contact.email)],
+                                },
+                                WbxmlNode::Tag {
+                                    name: "MobilePhoneNumber".into(),
+                                    children: vec![WbxmlNode::Text(contact.mobile_phone)],
+                                },
+                            ],
+                        },
+                    ],
+                }],
+            },
+        ],
+    }];
+
+    let encode_table = merge_encode_tables(vec![itemoperations_encode_table(), contacts_encode_table()]);
+    let page_of = |name: &str| {
+        if matches!(name, "ItemOperations" | "Status" | "Response" | "Fetch" | "ServerId" | "Properties") {
+            PAGE_ITEMOPERATIONS
+        } else {
+            PAGE_CONTACTS
+        }
+    };
+    let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &page_of) {
+        Ok(bytes) => bytes,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
+    };
+    (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
+}
+
+/// Handles a Calendar `Fetch`: returns the event's full field set under
+/// `Properties`, using the same field tags `Sync` already emits for
+/// calendar events (`appointment_to_add_node`).
+async fn handle_fetch_appointment(client: &CarbonioClient, server_id: String) -> Response {
+    let appt = match client.get_appointment(&server_id).await {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("GetAppointment from Carbonio failed: {e}")).into_response(),
+    };
+
+    let tree = vec![WbxmlNode::Tag {
+        name: "ItemOperations".into(),
+        children: vec![
+            WbxmlNode::Tag {
+                name: "Status".into(),
+                children: vec![WbxmlNode::Text("1".into())],
+            },
+            WbxmlNode::Tag {
+                name: "Response".into(),
+                children: vec![WbxmlNode::Tag {
+                    name: "Fetch".into(),
+                    children: vec![
+                        WbxmlNode::Tag {
+                            name: "Status".into(),
+                            children: vec![WbxmlNode::Text("1".into())],
+                        },
+                        WbxmlNode::Tag {
+                            name: "ServerId".into(),
+                            children: vec![WbxmlNode::Text(server_id)],
+                        },
+                        WbxmlNode::Tag {
+                            name: "Properties".into(),
+                            children: vec![
+                                WbxmlNode::Tag {
+                                    name: "Subject".into(),
+                                    children: vec![WbxmlNode::Text(appt.subject)],
+                                },
+                                WbxmlNode::Tag {
+                                    name: "Location".into(),
+                                    children: vec![WbxmlNode::Text(appt.location)],
+                                },
+                                WbxmlNode::Tag {
+                                    name: "StartTime".into(),
+                                    children: vec![WbxmlNode::Text(format_activesync_datetime(appt.start_epoch_ms))],
+                                },
+                                WbxmlNode::Tag {
+                                    name: "EndTime".into(),
+                                    children: vec![WbxmlNode::Text(format_activesync_datetime(appt.end_epoch_ms))],
+                                },
+                                WbxmlNode::Tag {
+                                    name: "AllDayEvent".into(),
+                                    children: vec![WbxmlNode::Text(if appt.all_day { "1" } else { "0" }.into())],
+                                },
+                            ],
+                        },
+                    ],
+                }],
+            },
+        ],
+    }];
+
+    let encode_table = merge_encode_tables(vec![itemoperations_encode_table(), calendar_encode_table()]);
+    let page_of = |name: &str| {
+        if matches!(name, "ItemOperations" | "Status" | "Response" | "Fetch" | "ServerId" | "Properties") {
+            PAGE_ITEMOPERATIONS
+        } else {
+            PAGE_CALENDAR
+        }
+    };
+    let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &page_of) {
+        Ok(bytes) => bytes,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
+    };
+    (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
+}
+
 /// Handles `SendMail`: the request body is a raw RFC 822 message (modern
 /// ActiveSync sends plain MIME here, not WBXML), parsed just enough to
 /// pull Subject/To/Cc/body and relay it through Carbonio's SendMsgRequest.
@@ -833,6 +1110,283 @@ async fn handle_send_mail(client: &CarbonioClient, body: &[u8]) -> Response {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, format!("SendMsgRequest to Carbonio failed: {e}")).into_response(),
     }
+}
+
+/// Handles `MoveItems`: moves a single item to another folder via
+/// Carbonio's own `ItemActionRequest`. Only one `<Move>` entry is handled
+/// even if the request lists several (a real device rarely sends more than
+/// one per request); later ones are ignored. Status codes are this
+/// project's own simplified success/failure pair (`1`/`2`), not a full
+/// mapping of MS-ASCMD's `Move` status table (invalid source, invalid
+/// destination, already exists, etc.) -- same unverified-against-spec
+/// caveat as `GetItemEstimate`'s codepage.
+async fn handle_move_items(client: &CarbonioClient, body: &[u8]) -> Response {
+    let decode_table = move_decode_table();
+    let nodes = match WbxmlDecoder::new(body, &decode_table).decode() {
+        Ok(n) => n,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("failed to decode MoveItems body: {e}")).into_response(),
+    };
+
+    let src_msg_id = match find_text_child(&nodes, "SrcMsgId") {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, "MoveItems body missing SrcMsgId").into_response(),
+    };
+    let dst_fld_id = match find_text_child(&nodes, "DstFldId") {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, "MoveItems body missing DstFldId").into_response(),
+    };
+
+    let status = match client.move_item(&src_msg_id, &dst_fld_id).await {
+        Ok(()) => "1",
+        Err(e) => {
+            eprintln!("[activesync] MoveItems failed: {e:?}");
+            "2"
+        }
+    };
+
+    let tree = vec![WbxmlNode::Tag {
+        name: "MoveItems".into(),
+        children: vec![WbxmlNode::Tag {
+            name: "Response".into(),
+            children: vec![
+                WbxmlNode::Tag {
+                    name: "Status".into(),
+                    children: vec![WbxmlNode::Text(status.into())],
+                },
+                WbxmlNode::Tag {
+                    name: "SrcMsgId".into(),
+                    children: vec![WbxmlNode::Text(src_msg_id.clone())],
+                },
+                WbxmlNode::Tag {
+                    name: "DstMsgId".into(),
+                    children: vec![WbxmlNode::Text(src_msg_id)],
+                },
+            ],
+        }],
+    }];
+
+    let encode_table = move_encode_table();
+    let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &|_name| PAGE_MOVE) {
+        Ok(bytes) => bytes,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
+    };
+    (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
+}
+
+/// Handles `ResolveRecipients`: looks up the first requested address (only
+/// one `<To>` is read, same simplification `MoveItems` makes for `<Move>`)
+/// in Carbonio's GAL. A GAL hit's display name is returned; no hit still
+/// returns Status 1 (resolved), just with the address echoed back as its
+/// own display name -- any syntactically valid address is fine to send to,
+/// GAL membership or not. No certificate or picture support.
+async fn handle_resolve_recipients(client: &CarbonioClient, body: &[u8]) -> Response {
+    let decode_table = resolverecipients_decode_table();
+    let nodes = match WbxmlDecoder::new(body, &decode_table).decode() {
+        Ok(n) => n,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("failed to decode ResolveRecipients body: {e}")).into_response(),
+    };
+
+    let address = match find_text_child(&nodes, "To") {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, "ResolveRecipients body missing To").into_response(),
+    };
+
+    let display_name = match client.resolve_recipient(&address).await {
+        Ok(Some(name)) => name,
+        Ok(None) => address.clone(),
+        Err(e) => {
+            eprintln!("[activesync] ResolveRecipients GAL lookup failed: {e:?}");
+            address.clone()
+        }
+    };
+
+    let tree = vec![WbxmlNode::Tag {
+        name: "ResolveRecipients".into(),
+        children: vec![
+            WbxmlNode::Tag {
+                name: "Status".into(),
+                children: vec![WbxmlNode::Text("1".into())],
+            },
+            WbxmlNode::Tag {
+                name: "Response".into(),
+                children: vec![WbxmlNode::Tag {
+                    name: "Recipient".into(),
+                    children: vec![
+                        WbxmlNode::Tag {
+                            name: "Status".into(),
+                            children: vec![WbxmlNode::Text("1".into())],
+                        },
+                        WbxmlNode::Tag {
+                            name: "DisplayName".into(),
+                            children: vec![WbxmlNode::Text(display_name)],
+                        },
+                        WbxmlNode::Tag {
+                            name: "EmailAddress".into(),
+                            children: vec![WbxmlNode::Text(address)],
+                        },
+                    ],
+                }],
+            },
+        ],
+    }];
+
+    let encode_table = resolverecipients_encode_table();
+    let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &|_name| PAGE_RESOLVERECIPIENTS) {
+        Ok(bytes) => bytes,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
+    };
+    (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
+}
+
+/// Handles `Settings`: just enough to stop a device from refusing to sync
+/// over an unanswered `Settings` request.
+/// - A `DeviceInformation`/`Set` is acknowledged (Status 1); the device
+///   info itself (model, OS, friendly name) isn't stored anywhere.
+/// - An `Oof`/`Get` always answers "out of office is off" (`OofState` 0);
+///   there's no real per-account Oof message storage or editing.
+/// Does not call Carbonio at all; both of these are static acknowledgments.
+fn handle_settings(body: &[u8]) -> Response {
+    let decode_table = settings_decode_table();
+    let wants_oof = match WbxmlDecoder::new(body, &decode_table).decode() {
+        Ok(nodes) => find_tag_children(&nodes, "Oof").is_some(),
+        Err(_) => false,
+    };
+
+    let mut settings_children = vec![WbxmlNode::Tag {
+        name: "Status".into(),
+        children: vec![WbxmlNode::Text("1".into())],
+    }];
+    if wants_oof {
+        settings_children.push(WbxmlNode::Tag {
+            name: "Oof".into(),
+            children: vec![
+                WbxmlNode::Tag {
+                    name: "Status".into(),
+                    children: vec![WbxmlNode::Text("1".into())],
+                },
+                WbxmlNode::Tag {
+                    name: "OofState".into(),
+                    children: vec![WbxmlNode::Text("0".into())],
+                },
+            ],
+        });
+    }
+
+    let tree = vec![WbxmlNode::Tag { name: "Settings".into(), children: settings_children }];
+
+    let encode_table = settings_encode_table();
+    let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &|_name| PAGE_SETTINGS) {
+        Ok(bytes) => bytes,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
+    };
+    (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
+}
+
+/// Handles `Search`: a flat free-text search, no boolean query trees
+/// (`And`/`Or`/`LessThan`/etc.), no GAL search -- Store must be "Mailbox".
+/// Reuses the same email field tags `Sync` already emits
+/// (`email_to_add_node`'s `Subject`/`From`), just under `Result` instead of
+/// `Add`. `Range` from the request isn't honored; up to 25 results are
+/// always returned.
+async fn handle_search(client: &CarbonioClient, body: &[u8]) -> Response {
+    let decode_table = search_decode_table();
+    let nodes = match WbxmlDecoder::new(body, &decode_table).decode() {
+        Ok(n) => n,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("failed to decode Search body: {e}")).into_response(),
+    };
+
+    let store_name = find_text_child(&nodes, "Name").unwrap_or_else(|| "Mailbox".to_string());
+    if store_name != "Mailbox" {
+        return (StatusCode::NOT_IMPLEMENTED, format!("Search store '{store_name}' is not implemented (only Mailbox)"))
+            .into_response();
+    }
+    let query = match find_text_child(&nodes, "Query") {
+        Some(q) => q,
+        None => return (StatusCode::BAD_REQUEST, "Search body missing Query").into_response(),
+    };
+
+    let messages = match client.search_messages_text(None, &query, 25).await {
+        Ok(m) => m,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("SearchRequest from Carbonio failed: {e}")).into_response(),
+    };
+
+    let results: Vec<WbxmlNode> = messages
+        .iter()
+        .map(|m| WbxmlNode::Tag {
+            name: "Result".into(),
+            children: vec![
+                WbxmlNode::Tag {
+                    name: "Class".into(),
+                    children: vec![WbxmlNode::Text("Email".into())],
+                },
+                WbxmlNode::Tag {
+                    name: "ServerId".into(),
+                    children: vec![WbxmlNode::Text(m.id.clone())],
+                },
+                WbxmlNode::Tag {
+                    name: "Properties".into(),
+                    children: vec![
+                        WbxmlNode::Tag {
+                            name: "Subject".into(),
+                            children: vec![WbxmlNode::Text(m.subject.clone())],
+                        },
+                        WbxmlNode::Tag {
+                            name: "From".into(),
+                            children: vec![WbxmlNode::Text(m.from.clone().unwrap_or_default())],
+                        },
+                    ],
+                },
+            ],
+        })
+        .collect();
+
+    let tree = vec![WbxmlNode::Tag {
+        name: "Search".into(),
+        children: vec![
+            WbxmlNode::Tag {
+                name: "Status".into(),
+                children: vec![WbxmlNode::Text("1".into())],
+            },
+            WbxmlNode::Tag {
+                name: "Response".into(),
+                children: vec![WbxmlNode::Tag {
+                    name: "Store".into(),
+                    children: vec![
+                        WbxmlNode::Tag {
+                            name: "Total".into(),
+                            children: vec![WbxmlNode::Text(results.len().to_string())],
+                        },
+                    ]
+                    .into_iter()
+                    .chain(results)
+                    .collect(),
+                }],
+            },
+        ],
+    }];
+
+    let encode_table = merge_encode_tables(vec![
+        search_encode_table(),
+        itemoperations_encode_table(),
+        email_encode_table(),
+        airsync_encode_table(),
+    ]);
+    let page_of = |name: &str| {
+        if matches!(name, "Properties") {
+            PAGE_ITEMOPERATIONS
+        } else if matches!(name, "Subject" | "From") {
+            PAGE_EMAIL
+        } else if matches!(name, "ServerId" | "Class") {
+            PAGE_AIRSYNC
+        } else {
+            PAGE_SEARCH
+        }
+    };
+    let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &page_of) {
+        Ok(bytes) => bytes,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
+    };
+    (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
 }
 
 /// Placeholder until a real logging crate (tracing) is wired in; keeps the
