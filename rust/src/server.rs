@@ -1,5 +1,5 @@
 use crate::activesync_http::{ensure_supported_command, parse_activesync_query, parse_basic_auth, ActiveSyncRequest};
-use crate::carbonio::{CarbonioClient, SyncOutcome};
+use crate::carbonio::{CarbonioClient, FolderSyncOutcome, SyncOutcome};
 use crate::codepages::{
     activesync_folder_type, airsync_encode_table, airsync_item_page_of, calendar_encode_table,
     contacts_encode_table, email_encode_table, folderhierarchy_decode_table, folderhierarchy_encode_table,
@@ -144,15 +144,12 @@ async fn handle_activesync(
 const FOLDER_HIERARCHY_COLLECTION: &str = "__folder_hierarchy__";
 
 /// Builds a FolderSync response: every Carbonio folder as an `<Add>` entry.
-/// SyncKey handling mirrors the `Sync` command's own state machine:
-/// - client sends "0": full folder list, assign and return a new key.
-/// - client sends the store's current key: already caught up, so this
-///   returns zero changes (not true delta sync; a folder added or renamed
-///   since the last FolderSync is not detected until the device issues
-///   another "0").
-/// - client sends anything else (stale/unknown key): Status 9 (invalid sync
-///   key per MS-ASCMD 2.2.3.165.3), telling the device to FolderSync again
-///   from scratch.
+/// SyncKey handling mirrors the `Sync` command's own real-delta state
+/// machine: "0" seeds a Carbonio `SyncRequest` token (just like an email,
+/// contacts, or calendar collection does) alongside the full folder list,
+/// the current key asks Carbonio what changed since via that same token
+/// and reports only the folders that did, and anything else is Status 9
+/// (invalid sync key per MS-ASCMD 2.2.3.165.3).
 async fn handle_folder_sync(
     client: &mut CarbonioClient,
     sync_state: &SyncStateStore,
@@ -167,46 +164,71 @@ async fn handle_folder_sync(
     let client_sync_key = find_text_child(&nodes, "SyncKey").unwrap_or_else(|| "0".to_string());
     let current_key = sync_state.current_key(&request.user, &request.device_id, FOLDER_HIERARCHY_COLLECTION);
 
-    if client_sync_key != "0" {
-        if client_sync_key != current_key {
-            return build_folder_sync_response("9", &current_key, Vec::new());
+    if client_sync_key == "0" {
+        let folders = match client.get_folders().await {
+            Ok(f) => f,
+            Err(e) => return (StatusCode::BAD_GATEWAY, format!("GetFolder from Carbonio failed: {e}")).into_response(),
+        };
+        let adds = folders.iter().map(folder_to_add_node).collect();
+
+        // A seed failure isn't fatal to this response (the device already
+        // has its full Add list either way); it just means the next
+        // FolderSync falls back to the old full-resync behavior via the
+        // plain counter, same fallback `Sync` already uses.
+        let new_key = match client.sync_folders_since(None).await {
+            Ok(FolderSyncOutcome::Delta { token, .. }) => match token.parse::<u64>() {
+                Ok(t) => sync_state.set_key(&request.user, &request.device_id, FOLDER_HIERARCHY_COLLECTION, t),
+                Err(_) => sync_state.advance_key(&request.user, &request.device_id, FOLDER_HIERARCHY_COLLECTION),
+            },
+            _ => sync_state.advance_key(&request.user, &request.device_id, FOLDER_HIERARCHY_COLLECTION),
+        };
+        return build_folder_sync_response("1", &new_key, adds);
+    }
+
+    if client_sync_key != current_key {
+        return build_folder_sync_response("9", &current_key, Vec::new());
+    }
+
+    match client.sync_folders_since(Some(&current_key)).await {
+        Ok(FolderSyncOutcome::MustResync) => build_folder_sync_response("9", &current_key, Vec::new()),
+        Ok(FolderSyncOutcome::Delta { token, changed_folders }) => {
+            if changed_folders.is_empty() {
+                return build_folder_sync_response("1", &current_key, Vec::new());
+            }
+            let adds = changed_folders.iter().map(folder_to_add_node).collect();
+            let new_key = match token.parse::<u64>() {
+                Ok(t) => sync_state.set_key(&request.user, &request.device_id, FOLDER_HIERARCHY_COLLECTION, t),
+                Err(_) => sync_state.advance_key(&request.user, &request.device_id, FOLDER_HIERARCHY_COLLECTION),
+            };
+            build_folder_sync_response("1", &new_key, adds)
         }
-        return build_folder_sync_response("1", &current_key, Vec::new());
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("SyncRequest (folders) from Carbonio failed: {e}")).into_response(),
     }
+}
 
-    let folders = match client.get_folders().await {
-        Ok(f) => f,
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("GetFolder from Carbonio failed: {e}")).into_response(),
-    };
-
-    let mut adds = Vec::with_capacity(folders.len());
-    for folder in &folders {
-        let parent_id = folder.parent_id.clone().unwrap_or_else(|| "0".to_string());
-        adds.push(WbxmlNode::Tag {
-            name: "Add".into(),
-            children: vec![
-                WbxmlNode::Tag {
-                    name: "ServerId".into(),
-                    children: vec![WbxmlNode::Text(folder.id.clone())],
-                },
-                WbxmlNode::Tag {
-                    name: "ParentId".into(),
-                    children: vec![WbxmlNode::Text(parent_id)],
-                },
-                WbxmlNode::Tag {
-                    name: "DisplayName".into(),
-                    children: vec![WbxmlNode::Text(folder.name.clone())],
-                },
-                WbxmlNode::Tag {
-                    name: "Type".into(),
-                    children: vec![WbxmlNode::Text(activesync_folder_type(folder.view.as_deref()).into())],
-                },
-            ],
-        });
+fn folder_to_add_node(folder: &crate::carbonio::CarbonioFolder) -> WbxmlNode {
+    let parent_id = folder.parent_id.clone().unwrap_or_else(|| "0".to_string());
+    WbxmlNode::Tag {
+        name: "Add".into(),
+        children: vec![
+            WbxmlNode::Tag {
+                name: "ServerId".into(),
+                children: vec![WbxmlNode::Text(folder.id.clone())],
+            },
+            WbxmlNode::Tag {
+                name: "ParentId".into(),
+                children: vec![WbxmlNode::Text(parent_id)],
+            },
+            WbxmlNode::Tag {
+                name: "DisplayName".into(),
+                children: vec![WbxmlNode::Text(folder.name.clone())],
+            },
+            WbxmlNode::Tag {
+                name: "Type".into(),
+                children: vec![WbxmlNode::Text(activesync_folder_type(folder.view.as_deref()).into())],
+            },
+        ],
     }
-
-    let new_key = sync_state.advance_key(&request.user, &request.device_id, FOLDER_HIERARCHY_COLLECTION);
-    build_folder_sync_response("1", &new_key, adds)
 }
 
 fn build_folder_sync_response(status: &str, sync_key: &str, adds: Vec<WbxmlNode>) -> Response {

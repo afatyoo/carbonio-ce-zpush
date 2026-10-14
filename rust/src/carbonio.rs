@@ -624,6 +624,59 @@ impl CarbonioClient {
         Ok(SyncOutcome::Delta { token, changed_ids })
     }
 
+    /// Same idea as [`Self::sync_since`], but account-wide (no `l`, so no
+    /// single-folder scope) and reading `SyncResponse.folder` instead of
+    /// `m`/`cn`/`appt`, for `FolderSync`'s own real delta sync. Verified
+    /// live: a changed/new folder comes back as a flat entry (not nested
+    /// under its parent) with an explicit `l` for its parent id, the same
+    /// shape `GetFolderResponse` uses per folder, just without the tree
+    /// nesting -- so this reuses `CarbonioFolder` for the result.
+    pub async fn sync_folders_since(&self, token: Option<&str>) -> Result<FolderSyncOutcome> {
+        let auth_token = self.auth_token.as_deref().context("sync_folders_since called before authenticate")?;
+
+        let mut sync_request = serde_json::Map::new();
+        sync_request.insert("_jsns".to_string(), json!("urn:zimbraMail"));
+        if let Some(t) = token {
+            sync_request.insert("token".to_string(), json!(t));
+        }
+        let request_body = json!({
+            "Body": { "SyncRequest": sync_request },
+            "Header": {
+                "context": {
+                    "_jsns": "urn:zimbra",
+                    "authToken": { "_content": auth_token }
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("SyncRequest (folders) failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<SyncRequestBody> = response
+            .json()
+            .await
+            .context("SyncRequest (folders) response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault.detail.map(|d| d.error.code).unwrap_or_else(|| "UNKNOWN".to_string());
+            if code == "mail.MUST_RESYNC" {
+                return Ok(FolderSyncOutcome::MustResync);
+            }
+            bail!("Carbonio SyncRequest (folders) failed ({code}): {}", fault.reason.text);
+        }
+
+        let resp = envelope.body.sync_response.context("SyncResponse missing from a non-fault SOAP reply")?;
+        let token = sync_token_to_string(&resp.token)?;
+        let changed_folders = resp.folder.into_iter().filter_map(RawSyncFolder::into_carbonio_folder).collect();
+        Ok(FolderSyncOutcome::Delta { token, changed_folders })
+    }
+
     /// Moves an item (any type: message, contact, appointment) to a
     /// different folder via `ItemActionRequest` (`urn:zimbraMail`) with
     /// `op=move`. Verified live: the item keeps its own id across the move
@@ -1482,6 +1535,16 @@ pub enum SyncOutcome {
     MustResync,
 }
 
+/// Result of [`CarbonioClient::sync_folders_since`]: the folder-hierarchy
+/// equivalent of [`SyncOutcome`], carrying full `CarbonioFolder` values
+/// (not just ids) since a changed folder's `SyncResponse` entry already has
+/// everything `FolderSync` needs, with no need for a follow-up call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FolderSyncOutcome {
+    Delta { token: String, changed_folders: Vec<CarbonioFolder> },
+    MustResync,
+}
+
 #[derive(Debug, Deserialize)]
 struct SyncRequestBody {
     #[serde(rename = "SyncResponse")]
@@ -1508,6 +1571,45 @@ struct SyncResponseJson {
     cn: Vec<RawSyncItem>,
     #[serde(default)]
     appt: Vec<RawSyncItem>,
+    /// Changed/new folders, for `sync_folders_since`. Only populated on an
+    /// account-wide (no `l`) call; an `l`-scoped item delta call just
+    /// leaves this empty.
+    #[serde(default)]
+    folder: Vec<RawSyncFolder>,
+}
+
+/// One changed or newly created folder from a folder-hierarchy
+/// `SyncResponse`. Unlike `GetFolderResponse`'s `RawFolder` (nested tree,
+/// parent implicit from nesting), this is a flat entry with its parent
+/// given explicitly via `l`, confirmed live against a real `CreateFolder`.
+#[derive(Debug, Deserialize)]
+struct RawSyncFolder {
+    id: String,
+    /// A baseline (no-token) account-wide call wraps everything under one
+    /// synthetic root entry that has neither `name` nor `l` (confirmed
+    /// live), unlike a real changed folder; both are `Option` so that
+    /// entry parses instead of failing the whole response, and
+    /// `into_carbonio_folder` filters it out.
+    name: Option<String>,
+    view: Option<String>,
+    #[serde(default)]
+    n: u32,
+    #[serde(default)]
+    i4ms: u64,
+    l: Option<String>,
+}
+
+impl RawSyncFolder {
+    fn into_carbonio_folder(self) -> Option<CarbonioFolder> {
+        Some(CarbonioFolder {
+            id: self.id,
+            parent_id: Some(self.l?),
+            name: self.name?,
+            view: self.view,
+            item_count: self.n,
+            mod_seq: self.i4ms,
+        })
+    }
 }
 
 /// Renders a `SyncResponse.token` (string or number) as a plain string.
@@ -2259,6 +2361,58 @@ mod tests {
         let resp = envelope.body.sync_response.unwrap();
         let ids: Vec<String> = resp.m.into_iter().chain(resp.cn).chain(resp.appt).map(|i| i.id).collect();
         assert_eq!(ids, vec!["306".to_string()]);
+    }
+
+    #[test]
+    fn sync_response_folder_extracts_a_flat_new_folder_with_its_parent() {
+        // Shape matches a real CreateFolderRequest hit, captured live from
+        // Carbonio CE (carbonio-core 4.5.14): a new folder's entry under an
+        // account-wide SyncResponse.folder is flat (not nested under its
+        // parent, unlike GetFolderResponse's tree) with an explicit `l`.
+        let raw = r#"{
+            "Body": {
+                "SyncResponse": {
+                    "md": 1,
+                    "token": "211",
+                    "folder": [{"id": "312", "name": "DeltaFolderTest", "l": "1", "view": "message", "n": 0, "i4ms": 211}]
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<SyncRequestBody> = serde_json::from_str(raw).unwrap();
+        let resp = envelope.body.sync_response.unwrap();
+        let folders: Vec<CarbonioFolder> = resp.folder.into_iter().filter_map(RawSyncFolder::into_carbonio_folder).collect();
+        assert_eq!(
+            folders,
+            vec![CarbonioFolder {
+                id: "312".into(),
+                parent_id: Some("1".into()),
+                name: "DeltaFolderTest".into(),
+                view: Some("message".into()),
+                item_count: 0,
+                mod_seq: 211,
+            }]
+        );
+    }
+
+    #[test]
+    fn sync_response_folder_skips_the_synthetic_root_on_a_baseline_call() {
+        // Confirmed live: an account-wide SyncRequest with no token wraps
+        // the whole folder tree under one synthetic root entry that has
+        // neither `name` nor `l`. This used to be a hard deserialize
+        // failure for the whole response (both fields were required),
+        // which meant seeding a FolderSync delta token always silently
+        // fell back to the plain counter.
+        let raw = r#"{
+            "Body": {
+                "SyncResponse": { "md": 1, "token": "211", "folder": [{"id": "11", "n": 0, "i4ms": 1}] }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<SyncRequestBody> = serde_json::from_str(raw).unwrap();
+        let resp = envelope.body.sync_response.unwrap();
+        let folders: Vec<CarbonioFolder> = resp.folder.into_iter().filter_map(RawSyncFolder::into_carbonio_folder).collect();
+        assert!(folders.is_empty());
     }
 
     #[test]
