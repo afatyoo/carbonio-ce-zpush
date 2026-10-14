@@ -345,23 +345,18 @@ async fn handle_sync(
                 Err(e) => return (StatusCode::BAD_GATEWAY, format!("SearchRequest (appointments) from Carbonio failed: {e}")).into_response(),
             },
         };
-        // Email also seeds a Carbonio-native sync token as its SyncKey (see
-        // the long comment below), so the *next* Sync can do a real delta
-        // instead of another full resync. A seed failure isn't fatal to
-        // this response (the device already has its Add list either way),
-        // it just means the next Sync falls back to the old full-resync
-        // behavior via the plain counter.
-        let new_key = match &kind {
-            CollectionKind::Email => match client.sync_since(None, &collection_id).await {
-                Ok(SyncOutcome::Delta { token, .. }) => match token.parse::<u64>() {
-                    Ok(t) => sync_state.set_key(&request.user, &request.device_id, &collection_id, t),
-                    Err(_) => sync_state.advance_key(&request.user, &request.device_id, &collection_id),
-                },
-                _ => sync_state.advance_key(&request.user, &request.device_id, &collection_id),
+        // Every collection kind also seeds a Carbonio-native `SyncRequest`
+        // token as its SyncKey (see the long comment below), so the *next*
+        // Sync can do a real delta instead of another full resync. A seed
+        // failure isn't fatal to this response (the device already has its
+        // Add list either way), it just means the next Sync falls back to
+        // the old full-resync behavior via the plain counter.
+        let new_key = match client.sync_since(None, &collection_id).await {
+            Ok(SyncOutcome::Delta { token, .. }) => match token.parse::<u64>() {
+                Ok(t) => sync_state.set_key(&request.user, &request.device_id, &collection_id, t),
+                Err(_) => sync_state.advance_key(&request.user, &request.device_id, &collection_id),
             },
-            CollectionKind::Contacts | CollectionKind::Calendar => {
-                sync_state.advance_key(&request.user, &request.device_id, &collection_id)
-            }
+            _ => sync_state.advance_key(&request.user, &request.device_id, &collection_id),
         };
         return build_sync_response(&collection_id, "1", &new_key, adds, &kind);
     }
@@ -370,42 +365,69 @@ async fn handle_sync(
         return build_sync_response(&collection_id, "3", &current_key, Vec::new(), &kind);
     }
 
-    // Email: the device is already caught up on *our* counter, but that
-    // doesn't mean nothing changed -- it only meant that before real delta
-    // sync existed. Now the "SyncKey" an email collection hands back is
-    // really Carbonio's own `SyncRequest` token (seeded above, and
-    // re-seeded below), so this calls `SyncRequest` again with that same
-    // token to ask Carbonio directly whether anything changed since, and
-    // fetches full details only for the ids that actually did. Contacts
-    // and Calendar don't get this yet (see Known limitations in the
-    // README): they still report zero changes here and only pick up new
-    // data when the device resets to SyncKey "0".
-    match &kind {
-        CollectionKind::Email => match client.sync_since(Some(&current_key), &collection_id).await {
-            Ok(SyncOutcome::MustResync) => build_sync_response(&collection_id, "3", &current_key, Vec::new(), &kind),
-            Ok(SyncOutcome::Delta { token, changed_ids }) => {
-                if changed_ids.is_empty() {
-                    return build_sync_response(&collection_id, "1", &current_key, Vec::new(), &kind);
-                }
-                let messages = match client.search_messages_by_ids(&changed_ids).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        return (StatusCode::BAD_GATEWAY, format!("SearchRequest (by id) from Carbonio failed: {e}")).into_response()
-                    }
-                };
-                let mut adds = Vec::with_capacity(messages.len());
-                for m in &messages {
-                    adds.push(email_to_add_node(client, m).await);
-                }
-                let new_key = match token.parse::<u64>() {
-                    Ok(t) => sync_state.set_key(&request.user, &request.device_id, &collection_id, t),
-                    Err(_) => sync_state.advance_key(&request.user, &request.device_id, &collection_id),
-                };
-                build_sync_response(&collection_id, "1", &new_key, adds, &kind)
+    // The device is already caught up on *our* counter, but that doesn't
+    // mean nothing changed -- it only meant that before real delta sync
+    // existed. Now the "SyncKey" this hands back is really Carbonio's own
+    // `SyncRequest` token (seeded above, and re-seeded below), so this
+    // calls `SyncRequest` again with that same token to ask Carbonio
+    // directly whether anything changed since, and fetches full details
+    // only for the ids that actually did (one request for email via
+    // `item:{...}`, one `GetContactsRequest`/`GetAppointmentRequest` per id
+    // for contacts/calendar, since there's no bulk-by-id call for those).
+    match client.sync_since(Some(&current_key), &collection_id).await {
+        Ok(SyncOutcome::MustResync) => build_sync_response(&collection_id, "3", &current_key, Vec::new(), &kind),
+        Ok(SyncOutcome::Delta { token, changed_ids }) => {
+            if changed_ids.is_empty() {
+                return build_sync_response(&collection_id, "1", &current_key, Vec::new(), &kind);
             }
-            Err(e) => (StatusCode::BAD_GATEWAY, format!("SyncRequest from Carbonio failed: {e}")).into_response(),
-        },
-        CollectionKind::Contacts | CollectionKind::Calendar => build_sync_response(&collection_id, "1", &current_key, Vec::new(), &kind),
+            let adds = match &kind {
+                CollectionKind::Email => {
+                    let messages = match client.search_messages_by_ids(&changed_ids).await {
+                        Ok(m) => m,
+                        Err(e) => {
+                            return (StatusCode::BAD_GATEWAY, format!("SearchRequest (by id) from Carbonio failed: {e}"))
+                                .into_response()
+                        }
+                    };
+                    let mut adds = Vec::with_capacity(messages.len());
+                    for m in &messages {
+                        adds.push(email_to_add_node(client, m).await);
+                    }
+                    adds
+                }
+                CollectionKind::Contacts => {
+                    let mut adds = Vec::with_capacity(changed_ids.len());
+                    for id in &changed_ids {
+                        match client.get_contact(id).await {
+                            Ok(c) => adds.push(contact_to_add_node(&c)),
+                            // A changed id Carbonio no longer has as a contact
+                            // (e.g. it was deleted, or moved to a different
+                            // item type) just isn't surfaced as an Add; this
+                            // project doesn't model Sync deletes anywhere else
+                            // either, so that's consistent, not a regression.
+                            Err(e) => eprintln!("[activesync] Sync (contacts delta) get_contact {id} failed: {e:?}"),
+                        }
+                    }
+                    adds
+                }
+                CollectionKind::Calendar => {
+                    let mut adds = Vec::with_capacity(changed_ids.len());
+                    for id in &changed_ids {
+                        match client.get_appointment(id).await {
+                            Ok(a) => adds.push(appointment_to_add_node(&a)),
+                            Err(e) => eprintln!("[activesync] Sync (calendar delta) get_appointment {id} failed: {e:?}"),
+                        }
+                    }
+                    adds
+                }
+            };
+            let new_key = match token.parse::<u64>() {
+                Ok(t) => sync_state.set_key(&request.user, &request.device_id, &collection_id, t),
+                Err(_) => sync_state.advance_key(&request.user, &request.device_id, &collection_id),
+            };
+            build_sync_response(&collection_id, "1", &new_key, adds, &kind)
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("SyncRequest from Carbonio failed: {e}")).into_response(),
     }
 }
 
@@ -666,13 +688,21 @@ fn handle_provision() -> Response {
 /// Status 2 ("changes found") is returned on any detected change. Carbonio's
 /// WaitSet only reports that the account changed, not which collection
 /// (confirmed live: a `WaitSetResponse.a[]` entry is just `{id, changeid}`,
-/// no folder breakdown), so this can't tell the device which of its watched
-/// folders actually has new data. The practical compromise: the device's
-/// own `Ping` request already lists which folders it's watching
-/// (`Folders`/`Folder`/`Id`/`Class`), so on Status 2 this echoes that same
-/// list back, same as every watched folder changed. That's the device's own
-/// list, so it's always a safe superset to re-`Sync`, even though it isn't
-/// Carbonio telling us which one really changed.
+/// no folder breakdown), so on its own it can't tell the device which of
+/// its watched folders actually has new data.
+///
+/// This narrows that down with a cheap trick instead: `GetFolderRequest`'s
+/// `i4ms` field (this project's `CarbonioFolder::mod_seq`) is a per-folder
+/// modification counter that only advances when something inside that
+/// folder changes, confirmed live by sending a message and watching only
+/// its target folder's `i4ms` move while every other folder's stayed put.
+/// So this snapshots `mod_seq` for every watched folder before the wait,
+/// and diffs it against a fresh snapshot after a change is detected --
+/// whichever watched folders actually moved are the real answer. If that
+/// diff ever comes back empty (a tight race between the two snapshots) or
+/// the second `GetFolderRequest` fails, this falls back to the old,
+/// strictly safe behavior: list every watched folder, since re-`Sync`-ing
+/// one that didn't change is harmless but missing one that did isn't.
 async fn handle_ping(client: &CarbonioClient, body: &[u8]) -> Response {
     let watched_folders = if body.is_empty() {
         Vec::new()
@@ -684,6 +714,8 @@ async fn handle_ping(client: &CarbonioClient, body: &[u8]) -> Response {
         }
     };
 
+    let mod_seqs_before = if watched_folders.is_empty() { None } else { client.get_folders().await.ok() };
+
     let (wait_set_id, seq) = match client.create_waitset().await {
         Ok(ids) => ids,
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("CreateWaitSetRequest to Carbonio failed: {e}")).into_response(),
@@ -694,12 +726,18 @@ async fn handle_ping(client: &CarbonioClient, body: &[u8]) -> Response {
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("WaitSetRequest to Carbonio failed: {e}")).into_response(),
     };
 
+    let reported_folders = if changed {
+        narrow_changed_folders(client, &watched_folders, mod_seqs_before).await
+    } else {
+        Vec::new()
+    };
+
     let mut ping_children = vec![WbxmlNode::Tag {
         name: "Status".into(),
         children: vec![WbxmlNode::Text(if changed { "2" } else { "1" }.into())],
     }];
-    if changed && !watched_folders.is_empty() {
-        let folder_nodes = watched_folders
+    if changed && !reported_folders.is_empty() {
+        let folder_nodes = reported_folders
             .into_iter()
             .map(|(id, class)| WbxmlNode::Tag {
                 name: "Folder".into(),
@@ -755,6 +793,42 @@ fn collect_ping_folders(nodes: &[WbxmlNode]) -> Vec<(String, String)> {
             Some((id, class))
         })
         .collect()
+}
+
+/// Narrows `watched_folders` down to the ones that actually changed, by
+/// diffing their `mod_seq` against a fresh `GetFolderRequest`. Falls back
+/// to the full `watched_folders` list (the old, always-safe behavior)
+/// whenever the narrowing itself can't be trusted: no "before" snapshot
+/// (`before` is `None`, e.g. the "before" call failed), the "after" call
+/// failing now, or the diff coming back with nothing narrower than what
+/// went in (a tight race, or `mod_seq` not actually distinguishing these
+/// folders for some reason this project hasn't seen yet).
+async fn narrow_changed_folders(
+    client: &CarbonioClient,
+    watched_folders: &[(String, String)],
+    before: Option<Vec<crate::carbonio::CarbonioFolder>>,
+) -> Vec<(String, String)> {
+    let Some(before) = before else { return watched_folders.to_vec() };
+    let Ok(after) = client.get_folders().await else { return watched_folders.to_vec() };
+
+    let narrowed: Vec<(String, String)> = watched_folders
+        .iter()
+        .filter(|(id, _)| {
+            let before_seq = before.iter().find(|f| &f.id == id).map(|f| f.mod_seq);
+            let after_seq = after.iter().find(|f| &f.id == id).map(|f| f.mod_seq);
+            match (before_seq, after_seq) {
+                (Some(b), Some(a)) => a > b,
+                _ => false,
+            }
+        })
+        .cloned()
+        .collect();
+
+    if narrowed.is_empty() {
+        watched_folders.to_vec()
+    } else {
+        narrowed
+    }
 }
 
 /// Handles `GetItemEstimate`: reports how many items are in the requested

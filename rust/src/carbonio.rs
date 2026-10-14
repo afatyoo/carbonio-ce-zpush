@@ -302,6 +302,12 @@ pub struct CarbonioFolder {
     pub view: Option<String>,
     /// Item count Carbonio reports for this folder (`n` in `GetFolderResponse`).
     pub item_count: u32,
+    /// Per-folder modification sequence (`i4ms` in `GetFolderResponse`):
+    /// advances whenever an item inside this folder changes, confirmed live
+    /// by sending a real message and seeing only the target folder's
+    /// `i4ms` move. Backs `Ping`'s per-folder change detection, since
+    /// Carbonio's `WaitSetRequest` itself can't say which folder changed.
+    pub mod_seq: u64,
 }
 
 fn flatten_folder(node: &RawFolder, parent_id: Option<String>, out: &mut Vec<CarbonioFolder>) {
@@ -314,6 +320,7 @@ fn flatten_folder(node: &RawFolder, parent_id: Option<String>, out: &mut Vec<Car
             name: node.name.clone(),
             view: node.view.clone(),
             item_count: node.n,
+            mod_seq: node.i4ms,
         });
     }
     for child in &node.folder {
@@ -341,6 +348,8 @@ struct RawFolder {
     view: Option<String>,
     #[serde(default)]
     n: u32,
+    #[serde(default)]
+    i4ms: u64,
     #[serde(default)]
     folder: Vec<RawFolder>,
 }
@@ -605,7 +614,13 @@ impl CarbonioClient {
 
         let resp = envelope.body.sync_response.context("SyncResponse missing from a non-fault SOAP reply")?;
         let token = sync_token_to_string(&resp.token)?;
-        let changed_ids = resp.m.into_iter().map(|m| m.id).collect();
+        let changed_ids = resp
+            .m
+            .into_iter()
+            .chain(resp.cn)
+            .chain(resp.appt)
+            .map(|item| item.id)
+            .collect();
         Ok(SyncOutcome::Delta { token, changed_ids })
     }
 
@@ -1482,8 +1497,17 @@ struct SyncResponseJson {
     /// session; same inconsistency this project already works around for
     /// `CreateWaitSetResponse`/`WaitSetResponse`'s own `seq` field.
     token: serde_json::Value,
+    /// Changed messages. Confirmed live: a `SyncRequest` scoped to one
+    /// folder (`l`) puts a changed item under a different field by type --
+    /// messages under `m`, contacts under `cn`, calendar events under
+    /// `appt` -- not one unified list. `sync_since` reads whichever of
+    /// these is relevant and merges them into one id list.
     #[serde(default)]
     m: Vec<RawSyncItem>,
+    #[serde(default)]
+    cn: Vec<RawSyncItem>,
+    #[serde(default)]
+    appt: Vec<RawSyncItem>,
 }
 
 /// Renders a `SyncResponse.token` (string or number) as a plain string.
@@ -1832,6 +1856,7 @@ mod tests {
                                 "name": "Inbox",
                                 "view": "message",
                                 "n": 5,
+                                "i4ms": 189,
                                 "folder": [
                                     {"id": "6", "name": "Sub", "view": "message"}
                                 ]
@@ -1858,6 +1883,7 @@ mod tests {
                     name: "Inbox".into(),
                     view: Some("message".into()),
                     item_count: 5,
+                    mod_seq: 189,
                 },
                 CarbonioFolder {
                     id: "6".into(),
@@ -1865,6 +1891,7 @@ mod tests {
                     name: "Sub".into(),
                     view: Some("message".into()),
                     item_count: 0,
+                    mod_seq: 0,
                 },
                 CarbonioFolder {
                     id: "10".into(),
@@ -1872,6 +1899,7 @@ mod tests {
                     name: "Calendar".into(),
                     view: Some("appointment".into()),
                     item_count: 0,
+                    mod_seq: 0,
                 },
             ]
         );
@@ -2199,6 +2227,38 @@ mod tests {
         let resp = envelope.body.sync_response.unwrap();
         assert_eq!(sync_token_to_string(&resp.token).unwrap(), "192");
         assert_eq!(resp.m.into_iter().map(|m| m.id).collect::<Vec<_>>(), vec!["295".to_string()]);
+    }
+
+    #[test]
+    fn sync_response_reads_changed_ids_from_cn_and_appt_too() {
+        // Shape matches real SyncRequest hits, captured live from Carbonio
+        // CE (carbonio-core 4.5.14): unlike `SearchResponse`'s unified `m`,
+        // a folder-scoped `SyncRequest` puts a changed contact under `cn`
+        // and a changed calendar event under `appt`, not `m`. Missing this
+        // was a real bug: a changed contact/appointment silently produced
+        // an empty id list (no error, serde just drops unknown fields),
+        // caught live when a real contact edit never showed up as a delta.
+        let cn_raw = r#"{
+            "Body": {
+                "SyncResponse": { "md": 1, "token": "204", "cn": [{"id": "304", "l": "7", "ms": 204}] }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<SyncRequestBody> = serde_json::from_str(cn_raw).unwrap();
+        let resp = envelope.body.sync_response.unwrap();
+        let ids: Vec<String> = resp.m.into_iter().chain(resp.cn).chain(resp.appt).map(|i| i.id).collect();
+        assert_eq!(ids, vec!["304".to_string()]);
+
+        let appt_raw = r#"{
+            "Body": {
+                "SyncResponse": { "md": 1, "token": "205", "appt": [{"id": "306", "l": "10", "ms": 205}] }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<SyncRequestBody> = serde_json::from_str(appt_raw).unwrap();
+        let resp = envelope.body.sync_response.unwrap();
+        let ids: Vec<String> = resp.m.into_iter().chain(resp.cn).chain(resp.appt).map(|i| i.id).collect();
+        assert_eq!(ids, vec!["306".to_string()]);
     }
 
     #[test]
