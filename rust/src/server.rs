@@ -1319,14 +1319,15 @@ async fn handle_send_mail(client: &CarbonioClient, body: &[u8]) -> Response {
     }
 }
 
-/// Handles `MoveItems`: moves a single item to another folder via
-/// Carbonio's own `ItemActionRequest`. Only one `<Move>` entry is handled
-/// even if the request lists several (a real device rarely sends more than
-/// one per request); later ones are ignored. Status codes are this
-/// project's own simplified success/failure pair (`1`/`2`), not a full
-/// mapping of MS-ASCMD's `Move` status table (invalid source, invalid
-/// destination, already exists, etc.) -- same unverified-against-spec
-/// caveat as `GetItemEstimate`'s codepage.
+/// Handles `MoveItems`: moves every `<Move>` entry in the request to its
+/// own destination folder via Carbonio's `ItemActionRequest`, each getting
+/// its own `<Response>`, cross-checked against the original PHP z-push's
+/// `moveitems.php` (which loops the same way). Status codes use the real
+/// MS-ASCMD `MOVEITEMSSTATUS` table (3 = success), confirmed against
+/// `zpushdefs.php`; this project doesn't yet distinguish invalid-source
+/// (1) from invalid-destination (2) on failure, since Carbonio's own
+/// error doesn't cleanly map to one or the other, so both report the
+/// generic cannot-move code (5).
 async fn handle_move_items(client: &CarbonioClient, body: &[u8]) -> Response {
     let decode_table = move_decode_table();
     let nodes = match WbxmlDecoder::new(body, &decode_table).decode() {
@@ -1334,26 +1335,38 @@ async fn handle_move_items(client: &CarbonioClient, body: &[u8]) -> Response {
         Err(e) => return (StatusCode::BAD_REQUEST, format!("failed to decode MoveItems body: {e}")).into_response(),
     };
 
-    let src_msg_id = match find_text_child(&nodes, "SrcMsgId") {
-        Some(id) => id,
-        None => return (StatusCode::BAD_REQUEST, "MoveItems body missing SrcMsgId").into_response(),
-    };
-    let dst_fld_id = match find_text_child(&nodes, "DstFldId") {
-        Some(id) => id,
-        None => return (StatusCode::BAD_REQUEST, "MoveItems body missing DstFldId").into_response(),
-    };
+    let mut move_entries = Vec::new();
+    find_all_tag_occurrences(&nodes, "Move", &mut move_entries);
+    if move_entries.is_empty() {
+        return (StatusCode::BAD_REQUEST, "MoveItems body had no Move entries").into_response();
+    }
 
-    let status = match client.move_item(&src_msg_id, &dst_fld_id).await {
-        Ok(()) => "1",
-        Err(e) => {
-            eprintln!("[activesync] MoveItems failed: {e:?}");
-            "2"
-        }
-    };
+    let mut responses = Vec::with_capacity(move_entries.len());
+    for move_children in move_entries {
+        let src_msg_id = match find_text_child(move_children, "SrcMsgId") {
+            Some(id) => id,
+            None => continue,
+        };
+        let dst_fld_id = match find_text_child(move_children, "DstFldId") {
+            Some(id) => id,
+            None => continue,
+        };
 
-    let tree = vec![WbxmlNode::Tag {
-        name: "MoveItems".into(),
-        children: vec![WbxmlNode::Tag {
+        // Real MS-ASCMD status table (MOVEITEMSSTATUS, cross-checked
+        // against the original PHP z-push's zpushdefs.php): 3 = success,
+        // 5 = cannot move (used here as the generic failure code; this
+        // project doesn't distinguish invalid-source (1) from
+        // invalid-destination (2), since Carbonio's own error doesn't
+        // cleanly map to one or the other).
+        let status = match client.move_item(&src_msg_id, &dst_fld_id).await {
+            Ok(()) => "3",
+            Err(e) => {
+                eprintln!("[activesync] MoveItems failed: {e:?}");
+                "5"
+            }
+        };
+
+        responses.push(WbxmlNode::Tag {
             name: "Response".into(),
             children: vec![
                 WbxmlNode::Tag {
@@ -1369,8 +1382,10 @@ async fn handle_move_items(client: &CarbonioClient, body: &[u8]) -> Response {
                     children: vec![WbxmlNode::Text(src_msg_id)],
                 },
             ],
-        }],
-    }];
+        });
+    }
+
+    let tree = vec![WbxmlNode::Tag { name: "MoveItems".into(), children: responses }];
 
     let encode_table = move_encode_table();
     let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &|_name| PAGE_MOVE) {
@@ -1380,12 +1395,70 @@ async fn handle_move_items(client: &CarbonioClient, body: &[u8]) -> Response {
     (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
 }
 
-/// Handles `ResolveRecipients`: looks up the first requested address (only
-/// one `<To>` is read, same simplification `MoveItems` makes for `<Move>`)
-/// in Carbonio's GAL. A GAL hit's display name is returned; no hit still
-/// returns Status 1 (resolved), just with the address echoed back as its
-/// own display name -- any syntactically valid address is fine to send to,
-/// GAL membership or not. No certificate or picture support.
+/// Finds every occurrence of `<tag_name>` in a decoded WBXML tree,
+/// recursively, and collects each one's children -- like
+/// `find_tag_children`, but for a tag that can legitimately repeat
+/// (`MoveItems`'s `Move`, `ResolveRecipients`'s `To`), where only the
+/// first match isn't enough.
+fn find_all_tag_occurrences<'a>(nodes: &'a [WbxmlNode], tag_name: &str, out: &mut Vec<&'a [WbxmlNode]>) {
+    for node in nodes {
+        if let WbxmlNode::Tag { name, children } = node {
+            if name == tag_name {
+                out.push(children);
+            }
+            find_all_tag_occurrences(children, tag_name, out);
+        }
+    }
+}
+
+/// Finds the text content of every occurrence of `<tag_name>` in a decoded
+/// WBXML tree, recursively -- the text-returning counterpart of
+/// `find_all_tag_occurrences`, for a repeatable tag whose content is plain
+/// text (`ResolveRecipients`'s `To`) rather than more child tags.
+fn find_all_text_occurrences(nodes: &[WbxmlNode], tag_name: &str, out: &mut Vec<String>) {
+    for node in nodes {
+        if let WbxmlNode::Tag { name, children } = node {
+            if name == tag_name {
+                if let Some(WbxmlNode::Text(text)) = children.first() {
+                    out.push(text.clone());
+                }
+            }
+            find_all_text_occurrences(children, tag_name, out);
+        }
+    }
+}
+
+fn recipient_node(kind: &str, display_name: &str, email: &str) -> WbxmlNode {
+    WbxmlNode::Tag {
+        name: "Recipient".into(),
+        children: vec![
+            WbxmlNode::Tag {
+                name: "Type".into(),
+                children: vec![WbxmlNode::Text(kind.into())],
+            },
+            WbxmlNode::Tag {
+                name: "DisplayName".into(),
+                children: vec![WbxmlNode::Text(display_name.into())],
+            },
+            WbxmlNode::Tag {
+                name: "EmailAddress".into(),
+                children: vec![WbxmlNode::Text(email.into())],
+            },
+        ],
+    }
+}
+
+/// Handles `ResolveRecipients`: resolves every requested `<To>` address,
+/// not just the first, cross-checked against the original PHP z-push's
+/// Zimbra backend. Each address is looked up in both the GAL
+/// (`SearchGalRequest`) and personal Contacts (`SearchRequest
+/// types=contact`), matching that backend's own two-source lookup; all
+/// matches from both go into one `RecipientCount`/`Recipient` list, typed
+/// `1` (GAL) or `2` (Contact) per MS-ASCMD. An address with no match in
+/// either source gets Status 4 (unresolved, MS-ASCMD's
+/// `RESOLVERECIPSSTATUS_RESPONSE_UNRESOLVEDRECIP`) instead of being
+/// treated as resolved to itself, since that's what the real backend
+/// does. No certificate, availability, or picture support.
 async fn handle_resolve_recipients(client: &CarbonioClient, body: &[u8]) -> Response {
     let decode_table = resolverecipients_decode_table();
     let nodes = match WbxmlDecoder::new(body, &decode_table).decode() {
@@ -1393,48 +1466,77 @@ async fn handle_resolve_recipients(client: &CarbonioClient, body: &[u8]) -> Resp
         Err(e) => return (StatusCode::BAD_REQUEST, format!("failed to decode ResolveRecipients body: {e}")).into_response(),
     };
 
-    let address = match find_text_child(&nodes, "To") {
-        Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, "ResolveRecipients body missing To").into_response(),
-    };
+    let mut addresses = Vec::new();
+    find_all_text_occurrences(&nodes, "To", &mut addresses);
+    if addresses.is_empty() {
+        return (StatusCode::BAD_REQUEST, "ResolveRecipients body missing To").into_response();
+    }
 
-    let display_name = match client.resolve_recipient(&address).await {
-        Ok(Some(name)) => name,
-        Ok(None) => address.clone(),
-        Err(e) => {
-            eprintln!("[activesync] ResolveRecipients GAL lookup failed: {e:?}");
-            address.clone()
-        }
-    };
+    let mut responses = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        let gal_matches = client.resolve_recipients_gal(&address).await.unwrap_or_else(|e| {
+            eprintln!("[activesync] ResolveRecipients GAL lookup for '{address}' failed: {e:?}");
+            Vec::new()
+        });
+        let contact_matches = client.search_contacts_text(&address, 20).await.unwrap_or_else(|e| {
+            eprintln!("[activesync] ResolveRecipients contacts lookup for '{address}' failed: {e:?}");
+            Vec::new()
+        });
+
+        let mut recipients: Vec<WbxmlNode> = gal_matches
+            .into_iter()
+            .map(|(display_name, email)| {
+                recipient_node("1", &display_name, if email.is_empty() { &address } else { &email })
+            })
+            .collect();
+        recipients.extend(contact_matches.into_iter().map(|c| {
+            let display_name = format!("{} {}", c.first_name, c.last_name).trim().to_string();
+            let email = if c.email.is_empty() { address.clone() } else { c.email };
+            recipient_node("2", &display_name, &email)
+        }));
+
+        let response_children = if recipients.is_empty() {
+            vec![
+                WbxmlNode::Tag {
+                    name: "To".into(),
+                    children: vec![WbxmlNode::Text(address.clone())],
+                },
+                WbxmlNode::Tag {
+                    name: "Status".into(),
+                    children: vec![WbxmlNode::Text("4".into())],
+                },
+            ]
+        } else {
+            vec![
+                WbxmlNode::Tag {
+                    name: "To".into(),
+                    children: vec![WbxmlNode::Text(address.clone())],
+                },
+                WbxmlNode::Tag {
+                    name: "Status".into(),
+                    children: vec![WbxmlNode::Text("1".into())],
+                },
+                WbxmlNode::Tag {
+                    name: "RecipientCount".into(),
+                    children: vec![WbxmlNode::Text(recipients.len().to_string())],
+                },
+            ]
+            .into_iter()
+            .chain(recipients)
+            .collect()
+        };
+        responses.push(WbxmlNode::Tag { name: "Response".into(), children: response_children });
+    }
 
     let tree = vec![WbxmlNode::Tag {
         name: "ResolveRecipients".into(),
-        children: vec![
-            WbxmlNode::Tag {
-                name: "Status".into(),
-                children: vec![WbxmlNode::Text("1".into())],
-            },
-            WbxmlNode::Tag {
-                name: "Response".into(),
-                children: vec![WbxmlNode::Tag {
-                    name: "Recipient".into(),
-                    children: vec![
-                        WbxmlNode::Tag {
-                            name: "Status".into(),
-                            children: vec![WbxmlNode::Text("1".into())],
-                        },
-                        WbxmlNode::Tag {
-                            name: "DisplayName".into(),
-                            children: vec![WbxmlNode::Text(display_name)],
-                        },
-                        WbxmlNode::Tag {
-                            name: "EmailAddress".into(),
-                            children: vec![WbxmlNode::Text(address)],
-                        },
-                    ],
-                }],
-            },
-        ],
+        children: vec![WbxmlNode::Tag {
+            name: "Status".into(),
+            children: vec![WbxmlNode::Text("1".into())],
+        }]
+        .into_iter()
+        .chain(responses)
+        .collect(),
     }];
 
     let encode_table = resolverecipients_encode_table();

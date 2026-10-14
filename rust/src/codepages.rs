@@ -215,10 +215,12 @@ const RESOLVERECIPIENTS_TAGS: &[(u8, &str)] = &[
     (0x05, "ResolveRecipients"),
     (0x06, "Response"),
     (0x07, "Status"),
+    (0x08, "Type"),
     (0x09, "Recipient"),
     (0x0A, "DisplayName"),
     (0x0B, "EmailAddress"),
     (0x10, "To"),
+    (0x12, "RecipientCount"),
 ];
 
 /// Search (codepage 15) tags, [MS-ASWBXML] 2.1.2.15. Minimal subset: one

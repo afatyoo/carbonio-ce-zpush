@@ -728,19 +728,21 @@ impl CarbonioClient {
 
     /// Looks up `address` in Carbonio's Global Address List via
     /// `SearchGalRequest` (`urn:zimbraAccount`), for `ResolveRecipients`.
-    /// Returns the GAL entry's display name if found; `None` if there is no
-    /// matching GAL entry (the caller falls back to treating the address as
-    /// already fully resolved, since it's typed by the user and syntactically
-    /// a valid address either way).
-    pub async fn resolve_recipient(&self, address: &str) -> Result<Option<String>> {
-        let token = self.auth_token.as_deref().context("resolve_recipient called before authenticate")?;
+    /// Returns every GAL match (display name, email), not just the first:
+    /// cross-checked against the original PHP z-push's Zimbra backend,
+    /// which does the same and reports a real `RecipientCount` for
+    /// ambiguous matches. `type: "all"` (not `"account"`, which this
+    /// project used before) also matches that backend, so a match can be
+    /// a resource or distribution list, not only a user account.
+    pub async fn resolve_recipients_gal(&self, address: &str) -> Result<Vec<(String, String)>> {
+        let token = self.auth_token.as_deref().context("resolve_recipients_gal called before authenticate")?;
 
         let request_body = json!({
             "Body": {
                 "SearchGalRequest": {
                     "_jsns": "urn:zimbraAccount",
                     "name": address,
-                    "type": "account"
+                    "type": "all"
                 }
             },
             "Header": {
@@ -773,13 +775,15 @@ impl CarbonioClient {
             bail!("Carbonio SearchGalRequest failed ({code}): {}", fault.reason.text);
         }
 
-        let display_name = envelope
+        let matches = envelope
             .body
             .search_gal_response
-            .and_then(|r| r.cn.into_iter().next())
-            .map(|cn| cn.file_as_str);
-
-        Ok(display_name)
+            .map(|r| r.cn)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cn| (cn.file_as_str, gal_attr_as_string(&cn.attrs, "email").unwrap_or_default()))
+            .collect();
+        Ok(matches)
     }
 
     /// Sends an email via `SendMsgRequest` (`urn:zimbraMail`), with an
@@ -939,6 +943,61 @@ impl CarbonioClient {
                 .map(|d| d.error.code)
                 .unwrap_or_else(|| "UNKNOWN".to_string());
             bail!("Carbonio SearchRequest (contacts) failed ({code}): {}", fault.reason.text);
+        }
+
+        let raw_contacts = envelope
+            .body
+            .search_response
+            .context("SearchResponse missing from a non-fault SOAP reply")?
+            .cn;
+
+        Ok(raw_contacts.into_iter().map(RawContact::into_carbonio_contact).collect())
+    }
+
+    /// Looks up `query` across every personal Contacts folder (no `inid`
+    /// scope), for `ResolveRecipients`. Cross-checked against the original
+    /// PHP z-push's Zimbra backend, which searches personal Contacts in
+    /// addition to the GAL for every recipient, not GAL alone.
+    pub async fn search_contacts_text(&self, query: &str, limit: u32) -> Result<Vec<CarbonioContact>> {
+        let token = self.auth_token.as_deref().context("search_contacts_text called before authenticate")?;
+
+        let request_body = json!({
+            "Body": {
+                "SearchRequest": {
+                    "_jsns": "urn:zimbraMail",
+                    "types": "contact",
+                    "query": { "_content": query },
+                    "limit": limit
+                }
+            },
+            "Header": {
+                "context": {
+                    "_jsns": "urn:zimbra",
+                    "authToken": { "_content": token }
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("SearchRequest (contacts text) failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<SearchContactsBody> = response
+            .json()
+            .await
+            .context("SearchRequest (contacts text) response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault
+                .detail
+                .map(|d| d.error.code)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio SearchRequest (contacts text) failed ({code}): {}", fault.reason.text);
         }
 
         let raw_contacts = envelope
@@ -1657,6 +1716,24 @@ struct SearchGalResponse {
 struct RawGalContact {
     #[serde(rename = "fileAsStr")]
     file_as_str: String,
+    /// `serde_json::Value`, not `String`: confirmed live that `type: "all"`
+    /// (needed to match non-account GAL entries, not just `"account"`)
+    /// can return multi-valued attributes like `objectClass` as a JSON
+    /// array, which broke deserializing the whole `_attrs` map when it
+    /// was typed as `HashMap<String, String>`.
+    #[serde(rename = "_attrs", default)]
+    attrs: HashMap<String, serde_json::Value>,
+}
+
+/// Reads one `_attrs` value as a plain string, whether Carbonio sent it as
+/// a bare string or (for a multi-valued attribute) the first element of a
+/// JSON array.
+fn gal_attr_as_string(attrs: &HashMap<String, serde_json::Value>, key: &str) -> Option<String> {
+    match attrs.get(key)? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(arr) => arr.first().and_then(|v| v.as_str()).map(|s| s.to_string()),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2296,6 +2373,30 @@ mod tests {
         let envelope: SoapEnvelope<SearchGalBody> = serde_json::from_str(raw).unwrap();
         let display_name = envelope.body.search_gal_response.and_then(|r| r.cn.into_iter().next()).map(|cn| cn.file_as_str);
         assert_eq!(display_name, Some("Carbonio Admin".to_string()));
+    }
+
+    #[test]
+    fn search_gal_response_with_multivalued_attr_still_parses() {
+        // Confirmed live: `type: "all"` (needed for non-account GAL
+        // entries) can return a multi-valued attribute like `objectClass`
+        // as a JSON array, which broke deserializing the whole `_attrs`
+        // map when every value was assumed to be a plain string.
+        let raw = r#"{
+            "Body": {
+                "SearchGalResponse": {
+                    "cn": [{
+                        "id": "x:258",
+                        "fileAsStr": "Carbonio Admin",
+                        "_attrs": {"email": "zextras@afatyo.com", "objectClass": ["inetOrgPerson", "zimbraAccount"]}
+                    }]
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<SearchGalBody> = serde_json::from_str(raw).unwrap();
+        let cn = envelope.body.search_gal_response.unwrap().cn.into_iter().next().unwrap();
+        assert_eq!(gal_attr_as_string(&cn.attrs, "email"), Some("zextras@afatyo.com".to_string()));
+        assert_eq!(gal_attr_as_string(&cn.attrs, "objectClass"), Some("inetOrgPerson".to_string()));
     }
 
     #[test]
