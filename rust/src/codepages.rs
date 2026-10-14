@@ -76,7 +76,7 @@ const EMAIL_TAGS: &[(u8, &str)] = &[
     (0x06, "Attachments"),
     (0x07, "AttName"),
     (0x08, "AttSize"),
-    (0x09, "Att0Id"),
+    (0x09, "AttOid"),
     (0x0A, "AttMethod"),
     (0x0C, "Body"),
     (0x0F, "DateReceived"),
@@ -113,22 +113,22 @@ const FOLDERHIERARCHY_TAGS: &[(u8, &str)] = &[
     (0x17, "Count"),
 ];
 
-/// ItemEstimate (codepage 6) tags, [MS-ASWBXML] 2.1.2.6. NOTE: these token
-/// values are reproduced from memory of the spec, not re-checked against
-/// the published MS-ASWBXML document or a real device, unlike the other
-/// tables here which were validated live against Carbonio. Treat this one
-/// as unverified until a real ActiveSync client's GetItemEstimate request
-/// has been captured and compared against it.
+/// ItemEstimate (codepage 6) tags, [MS-ASWBXML] 2.1.2.6. Cross-checked
+/// against the original PHP z-push's `lib/wbxml/wbxmldefs.php` (the fork
+/// this project was rewritten from): every token here was off by one
+/// (0x06 "Collections" was actually sitting on the deprecated/unused
+/// "Version" slot, cascading everything after it), which would have broken
+/// `GetItemEstimate` against any real device despite round-tripping fine
+/// in this project's own self-consistent encode/decode tests.
 const ITEMESTIMATE_TAGS: &[(u8, &str)] = &[
     (0x05, "GetItemEstimate"),
-    (0x06, "Collections"),
-    (0x07, "Collection"),
-    (0x08, "Class"),
-    (0x09, "CollectionId"),
-    (0x0A, "DateTime"),
-    (0x0B, "Estimate"),
-    (0x0C, "Response"),
-    (0x0D, "Status"),
+    (0x07, "Collections"),
+    (0x08, "Collection"),
+    (0x09, "Class"),
+    (0x0A, "CollectionId"),
+    (0x0C, "Estimate"),
+    (0x0D, "Response"),
+    (0x0E, "Status"),
 ];
 
 /// Ping (codepage 13) tags, [MS-ASWBXML] 2.1.2.13.
@@ -155,14 +155,23 @@ const PROVISION_TAGS: &[(u8, &str)] = &[
     (0x0A, "Data"),
     (0x0B, "Status"),
     (0x0C, "RemoteWipe"),
-    (0x0E, "DeviceInformation"),
 ];
 
-/// ItemOperations (codepage 20) tags, [MS-ASWBXML] 2.1.2.20. NOTE: like
-/// `ITEMESTIMATE_TAGS`, these token values are reproduced from memory and
-/// not re-checked against the published spec text or a real device.
-/// `ServerId`/`CollectionId` for a Fetch target come from the AirSync
-/// codepage (0), not this one.
+/// ItemOperations (codepage 20) tags, [MS-ASWBXML] 2.1.2.20. Cross-checked
+/// against the original PHP z-push's `wbxmldefs.php`: 0x05-0x0E here now
+/// match the real spec exactly. `ServerId`/`CollectionId` for a Fetch
+/// target really do come from the AirSync codepage (0) and are no longer
+/// self-contained here (see `AIRSYNC_TAGS`'s own 0x0D/0x12) -- a real
+/// device sends them there, so inventing a separate token for them on this
+/// page, as this project originally did, would have failed to decode a
+/// real device's request.
+///
+/// `FileReference`/`ContentType` are still self-contained placeholders:
+/// the real spec puts both under the AirSyncBase codepage (0x11), which
+/// this project doesn't implement (it still carries attachments/body
+/// through the deprecated Email-codepage fields, see `EMAIL_TAGS`'s own
+/// note). Fully fixing this means adding a real AirSyncBase codepage, not
+/// just a token number, so it's tracked as a known limitation instead.
 const ITEMOPERATIONS_TAGS: &[(u8, &str)] = &[
     (0x05, "ItemOperations"),
     (0x06, "Fetch"),
@@ -172,13 +181,6 @@ const ITEMOPERATIONS_TAGS: &[(u8, &str)] = &[
     (0x0C, "Data"),
     (0x0D, "Status"),
     (0x0E, "Response"),
-    // Not part of the official ItemOperations codepage (the spec reuses
-    // AirSync's tokens for these); kept self-contained here instead, same
-    // simplification already used for ITEMESTIMATE_TAGS's own CollectionId.
-    (0x10, "ServerId"),
-    (0x11, "CollectionId"),
-    // Also not verified against the spec's own token for these (see the
-    // module-level NOTE above); self-contained for the same reason.
     (0x12, "FileReference"),
     (0x13, "ContentType"),
 ];
@@ -198,11 +200,11 @@ const MOVE_TAGS: &[(u8, &str)] = &[
 ];
 
 /// ResolveRecipients (codepage 10) tags, [MS-ASWBXML] 2.1.2.10. Minimal
-/// subset: no certificate or picture support. Same unverified-against-spec
-/// caveat as `ITEMESTIMATE_TAGS`. `To` (the request's address list) is not
-/// part of the official codepage (the spec nests it differently); kept
-/// self-contained here the same way `ITEMOPERATIONS_TAGS` does for
-/// `FileReference`.
+/// subset: no certificate or picture support. Cross-checked against the
+/// original PHP z-push's `wbxmldefs.php`: `To` really is part of this
+/// codepage at 0x10, not self-contained as this project originally assumed
+/// (it was invented at 0x13, a real collision with the spec's own
+/// `MaxAmbiguousRecipients`).
 const RESOLVERECIPIENTS_TAGS: &[(u8, &str)] = &[
     (0x05, "ResolveRecipients"),
     (0x06, "Response"),
@@ -210,7 +212,7 @@ const RESOLVERECIPIENTS_TAGS: &[(u8, &str)] = &[
     (0x09, "Recipient"),
     (0x0A, "DisplayName"),
     (0x0B, "EmailAddress"),
-    (0x13, "To"),
+    (0x10, "To"),
 ];
 
 /// Search (codepage 15) tags, [MS-ASWBXML] 2.1.2.15. Minimal subset: one
@@ -226,14 +228,20 @@ const SEARCH_TAGS: &[(u8, &str)] = &[
     (0x0C, "Status"),
     (0x0D, "Response"),
     (0x0E, "Result"),
+    // Cross-checked against the original PHP z-push's `wbxmldefs.php`:
+    // this codepage really does define its own `Properties`, this
+    // project had wrongly routed a `Search` result's `Properties` through
+    // the ItemOperations codepage instead.
+    (0x0F, "Properties"),
     (0x10, "Total"),
 ];
 
 /// Settings (codepage 18) tags, [MS-ASWBXML] 2.1.2.18. Minimal subset: just
 /// enough to accept a `DeviceInformation` `Set` and answer an `Oof` `Get`
 /// with "out of office is off". No real per-device settings storage, no
-/// Oof message editing. Same unverified-against-spec caveat as
-/// `ITEMESTIMATE_TAGS`.
+/// Oof message editing. Cross-checked against the original PHP z-push's
+/// `wbxmldefs.php`: `DeviceInformation` is really at 0x16 (this project
+/// had invented 0x0D, which is actually `OofMessage` in the real spec).
 const SETTINGS_TAGS: &[(u8, &str)] = &[
     (0x05, "Settings"),
     (0x06, "Status"),
@@ -241,7 +249,7 @@ const SETTINGS_TAGS: &[(u8, &str)] = &[
     (0x08, "Set"),
     (0x09, "Oof"),
     (0x0A, "OofState"),
-    (0x0D, "DeviceInformation"),
+    (0x16, "DeviceInformation"),
 ];
 
 /// ActiveSync folder type codes (MS-ASCMD 2.2.3.165.1) for the Carbonio/Zimbra

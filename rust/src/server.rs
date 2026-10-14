@@ -1,12 +1,12 @@
 use crate::activesync_http::{ensure_supported_command, parse_activesync_query, parse_basic_auth, ActiveSyncRequest};
 use crate::carbonio::{CarbonioClient, FolderSyncOutcome, SyncOutcome};
 use crate::codepages::{
-    activesync_folder_type, airsync_encode_table, airsync_item_page_of, calendar_encode_table,
-    contacts_encode_table, email_encode_table, folderhierarchy_decode_table, folderhierarchy_encode_table,
-    itemestimate_decode_table,
+    activesync_folder_type, airsync_decode_table, airsync_encode_table, airsync_item_page_of,
+    calendar_encode_table, contacts_encode_table, email_encode_table, folderhierarchy_decode_table,
+    folderhierarchy_encode_table, itemestimate_decode_table,
     itemestimate_encode_table, itemoperations_decode_table, itemoperations_encode_table,
-    merge_encode_tables, move_decode_table, move_encode_table, ping_decode_table, ping_encode_table,
-    provision_encode_table, resolverecipients_decode_table, resolverecipients_encode_table,
+    merge_decode_tables, merge_encode_tables, move_decode_table, move_encode_table, ping_decode_table,
+    ping_encode_table, provision_encode_table, resolverecipients_decode_table, resolverecipients_encode_table,
     search_decode_table, search_encode_table, settings_decode_table, settings_encode_table,
     PAGE_AIRSYNC, PAGE_CALENDAR, PAGE_CONTACTS, PAGE_EMAIL, PAGE_FOLDERHIERARCHY, PAGE_ITEMESTIMATE,
     PAGE_ITEMOPERATIONS, PAGE_MOVE, PAGE_PING, PAGE_PROVISION, PAGE_RESOLVERECIPIENTS, PAGE_SEARCH, PAGE_SETTINGS,
@@ -492,7 +492,7 @@ async fn email_to_add_node(client: &CarbonioClient, m: &crate::carbonio::Carboni
                                 children: vec![WbxmlNode::Text(a.size.to_string())],
                             },
                             WbxmlNode::Tag {
-                                name: "Att0Id".into(),
+                                name: "AttOid".into(),
                                 children: vec![WbxmlNode::Text(format!("{}:{}", m.id, a.part_id))],
                             },
                             WbxmlNode::Tag {
@@ -912,10 +912,10 @@ async fn handle_get_item_estimate(client: &CarbonioClient, body: &[u8]) -> Respo
 
 /// Handles `ItemOperations`/`Fetch` for an email message: fetches the
 /// plain-text body via `GetMsgRequest` and returns it under `Properties`.
-/// Only email Fetch is implemented (no attachment download, no
-/// Contacts/Calendar Fetch). WBXML token values for this command's
-/// codepage are unverified against a real device, same caveat as
-/// `GetItemEstimate` -- see `codepages::ITEMOPERATIONS_TAGS`.
+/// `ServerId`/`CollectionId` here are the real AirSync-codepage tokens
+/// (cross-checked against the original PHP z-push), not self-contained
+/// `ItemOperations` ones, so this decodes with both codepages merged in
+/// case a real device page-switches to send them.
 /// `FileReference` for an attachment is our own opaque scheme:
 /// `"<message_id>:<part_id>"`, generated when listing attachments on a
 /// Sync Add node (see `email_to_add_node`) and parsed back out here. Real
@@ -926,7 +926,7 @@ fn parse_attachment_file_reference(file_reference: &str) -> Option<(&str, &str)>
 }
 
 async fn handle_item_operations(client: &CarbonioClient, body: &[u8]) -> Response {
-    let decode_table = itemoperations_decode_table();
+    let decode_table = merge_decode_tables(vec![itemoperations_decode_table(), airsync_decode_table()]);
     let nodes = match WbxmlDecoder::new(body, &decode_table).decode() {
         Ok(n) => n,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("failed to decode ItemOperations body: {e}")).into_response(),
@@ -1004,8 +1004,16 @@ async fn handle_item_operations(client: &CarbonioClient, body: &[u8]) -> Respons
         ],
     }];
 
-    let encode_table = merge_encode_tables(vec![itemoperations_encode_table(), email_encode_table()]);
-    let page_of = |name: &str| if name == "Body" { PAGE_EMAIL } else { PAGE_ITEMOPERATIONS };
+    let encode_table = merge_encode_tables(vec![itemoperations_encode_table(), email_encode_table(), airsync_encode_table()]);
+    let page_of = |name: &str| {
+        if name == "Body" {
+            PAGE_EMAIL
+        } else if name == "ServerId" {
+            PAGE_AIRSYNC
+        } else {
+            PAGE_ITEMOPERATIONS
+        }
+    };
     let encoded = match WbxmlEncoder::new(&encode_table).encode(&tree, &page_of) {
         Ok(bytes) => bytes,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("WBXML encode failed: {e}")).into_response(),
@@ -1131,9 +1139,11 @@ async fn handle_fetch_contact(client: &CarbonioClient, server_id: String) -> Res
         ],
     }];
 
-    let encode_table = merge_encode_tables(vec![itemoperations_encode_table(), contacts_encode_table()]);
+    let encode_table = merge_encode_tables(vec![itemoperations_encode_table(), contacts_encode_table(), airsync_encode_table()]);
     let page_of = |name: &str| {
-        if matches!(name, "ItemOperations" | "Status" | "Response" | "Fetch" | "ServerId" | "Properties") {
+        if name == "ServerId" {
+            PAGE_AIRSYNC
+        } else if matches!(name, "ItemOperations" | "Status" | "Response" | "Fetch" | "Properties") {
             PAGE_ITEMOPERATIONS
         } else {
             PAGE_CONTACTS
@@ -1206,9 +1216,11 @@ async fn handle_fetch_appointment(client: &CarbonioClient, server_id: String) ->
         ],
     }];
 
-    let encode_table = merge_encode_tables(vec![itemoperations_encode_table(), calendar_encode_table()]);
+    let encode_table = merge_encode_tables(vec![itemoperations_encode_table(), calendar_encode_table(), airsync_encode_table()]);
     let page_of = |name: &str| {
-        if matches!(name, "ItemOperations" | "Status" | "Response" | "Fetch" | "ServerId" | "Properties") {
+        if name == "ServerId" {
+            PAGE_AIRSYNC
+        } else if matches!(name, "ItemOperations" | "Status" | "Response" | "Fetch" | "Properties") {
             PAGE_ITEMOPERATIONS
         } else {
             PAGE_CALENDAR
@@ -1514,16 +1526,9 @@ async fn handle_search(client: &CarbonioClient, body: &[u8]) -> Response {
         ],
     }];
 
-    let encode_table = merge_encode_tables(vec![
-        search_encode_table(),
-        itemoperations_encode_table(),
-        email_encode_table(),
-        airsync_encode_table(),
-    ]);
+    let encode_table = merge_encode_tables(vec![search_encode_table(), email_encode_table(), airsync_encode_table()]);
     let page_of = |name: &str| {
-        if matches!(name, "Properties") {
-            PAGE_ITEMOPERATIONS
-        } else if matches!(name, "Subject" | "From") {
+        if matches!(name, "Subject" | "From") {
             PAGE_EMAIL
         } else if matches!(name, "ServerId" | "Class") {
             PAGE_AIRSYNC
