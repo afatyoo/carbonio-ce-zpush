@@ -1,5 +1,5 @@
 use crate::activesync_http::{ensure_supported_command, parse_activesync_query, parse_basic_auth, ActiveSyncRequest};
-use crate::carbonio::CarbonioClient;
+use crate::carbonio::{CarbonioClient, SyncOutcome};
 use crate::codepages::{
     activesync_folder_type, airsync_encode_table, airsync_item_page_of, calendar_encode_table,
     contacts_encode_table, email_encode_table, folderhierarchy_decode_table, folderhierarchy_encode_table,
@@ -324,7 +324,7 @@ async fn handle_sync(
 
     let current_key = sync_state.current_key(&request.user, &request.device_id, &collection_id);
 
-    let (new_key, adds) = if client_sync_key == "0" {
+    if client_sync_key == "0" {
         let adds = match &kind {
             CollectionKind::Email => match client.search_messages(&collection_id, 25).await {
                 Ok(messages) => {
@@ -345,15 +345,68 @@ async fn handle_sync(
                 Err(e) => return (StatusCode::BAD_GATEWAY, format!("SearchRequest (appointments) from Carbonio failed: {e}")).into_response(),
             },
         };
-        let new_key = sync_state.advance_key(&request.user, &request.device_id, &collection_id);
-        (new_key, adds)
-    } else if client_sync_key == current_key {
-        (current_key, Vec::new())
-    } else {
-        return build_sync_response(&collection_id, "3", &current_key, Vec::new(), &kind);
-    };
+        // Email also seeds a Carbonio-native sync token as its SyncKey (see
+        // the long comment below), so the *next* Sync can do a real delta
+        // instead of another full resync. A seed failure isn't fatal to
+        // this response (the device already has its Add list either way),
+        // it just means the next Sync falls back to the old full-resync
+        // behavior via the plain counter.
+        let new_key = match &kind {
+            CollectionKind::Email => match client.sync_since(None, &collection_id).await {
+                Ok(SyncOutcome::Delta { token, .. }) => match token.parse::<u64>() {
+                    Ok(t) => sync_state.set_key(&request.user, &request.device_id, &collection_id, t),
+                    Err(_) => sync_state.advance_key(&request.user, &request.device_id, &collection_id),
+                },
+                _ => sync_state.advance_key(&request.user, &request.device_id, &collection_id),
+            },
+            CollectionKind::Contacts | CollectionKind::Calendar => {
+                sync_state.advance_key(&request.user, &request.device_id, &collection_id)
+            }
+        };
+        return build_sync_response(&collection_id, "1", &new_key, adds, &kind);
+    }
 
-    build_sync_response(&collection_id, "1", &new_key, adds, &kind)
+    if client_sync_key != current_key {
+        return build_sync_response(&collection_id, "3", &current_key, Vec::new(), &kind);
+    }
+
+    // Email: the device is already caught up on *our* counter, but that
+    // doesn't mean nothing changed -- it only meant that before real delta
+    // sync existed. Now the "SyncKey" an email collection hands back is
+    // really Carbonio's own `SyncRequest` token (seeded above, and
+    // re-seeded below), so this calls `SyncRequest` again with that same
+    // token to ask Carbonio directly whether anything changed since, and
+    // fetches full details only for the ids that actually did. Contacts
+    // and Calendar don't get this yet (see Known limitations in the
+    // README): they still report zero changes here and only pick up new
+    // data when the device resets to SyncKey "0".
+    match &kind {
+        CollectionKind::Email => match client.sync_since(Some(&current_key), &collection_id).await {
+            Ok(SyncOutcome::MustResync) => build_sync_response(&collection_id, "3", &current_key, Vec::new(), &kind),
+            Ok(SyncOutcome::Delta { token, changed_ids }) => {
+                if changed_ids.is_empty() {
+                    return build_sync_response(&collection_id, "1", &current_key, Vec::new(), &kind);
+                }
+                let messages = match client.search_messages_by_ids(&changed_ids).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        return (StatusCode::BAD_GATEWAY, format!("SearchRequest (by id) from Carbonio failed: {e}")).into_response()
+                    }
+                };
+                let mut adds = Vec::with_capacity(messages.len());
+                for m in &messages {
+                    adds.push(email_to_add_node(client, m).await);
+                }
+                let new_key = match token.parse::<u64>() {
+                    Ok(t) => sync_state.set_key(&request.user, &request.device_id, &collection_id, t),
+                    Err(_) => sync_state.advance_key(&request.user, &request.device_id, &collection_id),
+                };
+                build_sync_response(&collection_id, "1", &new_key, adds, &kind)
+            }
+            Err(e) => (StatusCode::BAD_GATEWAY, format!("SyncRequest from Carbonio failed: {e}")).into_response(),
+        },
+        CollectionKind::Contacts | CollectionKind::Calendar => build_sync_response(&collection_id, "1", &current_key, Vec::new(), &kind),
+    }
 }
 
 /// Builds a Sync `<Add>` node for one email. When the message has an

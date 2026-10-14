@@ -68,33 +68,48 @@ impl SyncStateStore {
     /// losing the latest snapshot is recoverable (worst case: one extra
     /// FolderSync after a crash) and should not break a live sync reply.
     pub fn advance_key(&self, user: &str, device_id: &str, collection_id: &str) -> String {
-        let snapshot = {
+        let new_key = {
             let mut keys = self.keys.lock().expect("sync state mutex poisoned");
             let entry = keys
                 .entry((user.to_string(), device_id.to_string(), collection_id.to_string()))
                 .or_insert(0);
             *entry += 1;
-            let new_key = entry.to_string();
-            let snapshot: Vec<PersistedEntry> = keys
-                .iter()
-                .map(|((u, d, c), k)| PersistedEntry {
-                    user: u.clone(),
-                    device_id: d.clone(),
-                    collection_id: c.clone(),
-                    key: *k,
-                })
-                .collect();
-            drop(keys);
-            (new_key, snapshot)
+            *entry
         };
-        let (new_key, entries) = snapshot;
+        self.persist_and_return(new_key)
+    }
 
+    /// Sets the SyncKey for this (user, device, collection) to an exact
+    /// value instead of incrementing it, for collections whose "key" is
+    /// really an opaque token from elsewhere (Carbonio's own `SyncRequest`
+    /// token, for email's real delta sync) rather than a counter this store
+    /// owns. Same persistence behavior as [`Self::advance_key`].
+    pub fn set_key(&self, user: &str, device_id: &str, collection_id: &str, key: u64) -> String {
+        {
+            let mut keys = self.keys.lock().expect("sync state mutex poisoned");
+            keys.insert((user.to_string(), device_id.to_string(), collection_id.to_string()), key);
+        }
+        self.persist_and_return(key)
+    }
+
+    fn persist_and_return(&self, key: u64) -> String {
         if let Some(path) = &self.persist_path {
+            let entries: Vec<PersistedEntry> = {
+                let keys = self.keys.lock().expect("sync state mutex poisoned");
+                keys.iter()
+                    .map(|((u, d, c), k)| PersistedEntry {
+                        user: u.clone(),
+                        device_id: d.clone(),
+                        collection_id: c.clone(),
+                        key: *k,
+                    })
+                    .collect()
+            };
             if let Err(e) = write_snapshot(path, &entries) {
                 eprintln!("[sync_state] failed to persist snapshot to {path}: {e:?}");
             }
         }
-        new_key
+        key.to_string()
     }
 }
 
@@ -130,6 +145,15 @@ mod tests {
         assert_eq!(store.advance_key("alice", "DEV1", "2"), "1");
         assert_eq!(store.current_key("alice", "DEV1", "2"), "1");
         assert_eq!(store.advance_key("alice", "DEV1", "2"), "2");
+    }
+
+    #[test]
+    fn set_key_jumps_straight_to_an_exact_value_and_persists() {
+        let store = SyncStateStore::new();
+        assert_eq!(store.set_key("alice", "DEV1", "2", 190), "190");
+        assert_eq!(store.current_key("alice", "DEV1", "2"), "190");
+        assert_eq!(store.set_key("alice", "DEV1", "2", 192), "192");
+        assert_eq!(store.current_key("alice", "DEV1", "2"), "192");
     }
 
     #[test]

@@ -420,6 +420,67 @@ impl CarbonioClient {
         Ok(raw_messages.into_iter().map(RawMessage::into_carbonio_message).collect())
     }
 
+    /// Fetches the full search-result shape (subject, sender, read flag,
+    /// etc.) for a specific, already-known set of message ids, via
+    /// `SearchRequest` with Zimbra's `item:{id1,id2,...}` query operator.
+    /// Backs real delta `Sync`: `sync_since` only returns bare ids, so this
+    /// is the follow-up call that turns those ids into real `Add` nodes. An
+    /// empty `ids` list skips the round trip entirely and returns an empty
+    /// result, since `item:{}` is not a valid Carbonio query.
+    pub async fn search_messages_by_ids(&self, ids: &[String]) -> Result<Vec<CarbonioMessage>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let token = self.auth_token.as_deref().context("search_messages_by_ids called before authenticate")?;
+
+        let request_body = json!({
+            "Body": {
+                "SearchRequest": {
+                    "_jsns": "urn:zimbraMail",
+                    "types": "message",
+                    "query": { "_content": format!("item:{{{}}}", ids.join(",")) },
+                    "limit": ids.len()
+                }
+            },
+            "Header": {
+                "context": {
+                    "_jsns": "urn:zimbra",
+                    "authToken": { "_content": token }
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("SearchRequest (by id) failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<SearchBody> = response
+            .json()
+            .await
+            .context("SearchRequest (by id) response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault
+                .detail
+                .map(|d| d.error.code)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio SearchRequest (by id) failed ({code}): {}", fault.reason.text);
+        }
+
+        let raw_messages = envelope
+            .body
+            .search_response
+            .context("SearchResponse missing from a non-fault SOAP reply")?
+            .m;
+
+        Ok(raw_messages.into_iter().map(RawMessage::into_carbonio_message).collect())
+    }
+
     /// Lists up to `limit` messages matching `free_text`, newest first, via
     /// the same `SearchRequest` as `search_messages` but with the free text
     /// as the query. When `folder_id` is given, the query is scoped to that
@@ -484,6 +545,68 @@ impl CarbonioClient {
             .m;
 
         Ok(raw_messages.into_iter().map(RawMessage::into_carbonio_message).collect())
+    }
+
+    /// Carbonio's own incremental-sync token, via `SyncRequest`
+    /// (`urn:zimbraMail`). Verified live: `token` is the same number
+    /// `GetInfoRequest`'s change token advances to on every mailbox change,
+    /// and a later `SyncRequest` with an earlier `token` (and `l` to scope
+    /// it to one folder) returns only the items that changed since then
+    /// under `m` -- real delta sync, not a full resync. `token: None` seeds
+    /// a fresh baseline (an empty `m`, since there's nothing "since" yet)
+    /// and just returns the current token to store for next time.
+    ///
+    /// Carbonio expires old sync tombstones, so a `token` that's aged out
+    /// comes back as a `mail.MUST_RESYNC` fault; that's a real, expected
+    /// outcome (not every call that returns `Err` here is a failure), so
+    /// this reports it as `Ok(SyncOutcome::MustResync)` instead of an
+    /// error, and callers fall back to a full resync exactly like an
+    /// unrecognized ActiveSync SyncKey already does.
+    pub async fn sync_since(&self, token: Option<&str>, folder_id: &str) -> Result<SyncOutcome> {
+        let auth_token = self.auth_token.as_deref().context("sync_since called before authenticate")?;
+
+        let mut sync_request = serde_json::Map::new();
+        sync_request.insert("_jsns".to_string(), json!("urn:zimbraMail"));
+        sync_request.insert("l".to_string(), json!(folder_id));
+        if let Some(t) = token {
+            sync_request.insert("token".to_string(), json!(t));
+        }
+        let request_body = json!({
+            "Body": { "SyncRequest": sync_request },
+            "Header": {
+                "context": {
+                    "_jsns": "urn:zimbra",
+                    "authToken": { "_content": auth_token }
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("SyncRequest failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<SyncRequestBody> = response
+            .json()
+            .await
+            .context("SyncRequest response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault.detail.map(|d| d.error.code).unwrap_or_else(|| "UNKNOWN".to_string());
+            if code == "mail.MUST_RESYNC" {
+                return Ok(SyncOutcome::MustResync);
+            }
+            bail!("Carbonio SyncRequest failed ({code}): {}", fault.reason.text);
+        }
+
+        let resp = envelope.body.sync_response.context("SyncResponse missing from a non-fault SOAP reply")?;
+        let token = sync_token_to_string(&resp.token)?;
+        let changed_ids = resp.m.into_iter().map(|m| m.id).collect();
+        Ok(SyncOutcome::Delta { token, changed_ids })
     }
 
     /// Moves an item (any type: message, contact, appointment) to a
@@ -1334,6 +1457,53 @@ pub struct MessageDetails {
     pub attachments: Vec<AttachmentRef>,
 }
 
+/// Result of [`CarbonioClient::sync_since`]: either a real delta (possibly
+/// empty, meaning "nothing changed") with a token to store for next time, or
+/// a signal that the given token is too old for Carbonio to diff against
+/// anymore, so the caller needs to fall back to a full resync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncOutcome {
+    Delta { token: String, changed_ids: Vec<String> },
+    MustResync,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncRequestBody {
+    #[serde(rename = "SyncResponse")]
+    sync_response: Option<SyncResponseJson>,
+    #[serde(rename = "Fault")]
+    fault: Option<SoapFault>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncResponseJson {
+    /// Comes back as a bare JSON number on some calls and a quoted string
+    /// on others, confirmed live against the same account in the same
+    /// session; same inconsistency this project already works around for
+    /// `CreateWaitSetResponse`/`WaitSetResponse`'s own `seq` field.
+    token: serde_json::Value,
+    #[serde(default)]
+    m: Vec<RawSyncItem>,
+}
+
+/// Renders a `SyncResponse.token` (string or number) as a plain string.
+fn sync_token_to_string(token: &serde_json::Value) -> Result<String> {
+    match token {
+        serde_json::Value::String(s) => Ok(s.clone()),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        other => bail!("SyncResponse.token was neither a string nor a number: {other:?}"),
+    }
+}
+
+/// One changed item from `SyncResponse.m`. Only the id is used (the full
+/// details come from a follow-up `search_messages_by_ids` call); `l`
+/// (the item's folder) and the rest of the fields this carries aren't
+/// needed since the request already scopes `SyncRequest` to one folder.
+#[derive(Debug, Deserialize)]
+struct RawSyncItem {
+    id: String,
+}
+
 /// `ItemActionResponse`'s own `action` echo isn't used for anything (its
 /// `id` is the same id we sent); only whether a `Fault` came back matters.
 #[derive(Debug, Deserialize)]
@@ -2007,6 +2177,73 @@ mod tests {
         let envelope: SoapEnvelope<SearchGalBody> = serde_json::from_str(raw).unwrap();
         let display_name = envelope.body.search_gal_response.and_then(|r| r.cn.into_iter().next()).map(|cn| cn.file_as_str);
         assert_eq!(display_name, None);
+    }
+
+    #[test]
+    fn sync_response_extracts_token_and_changed_ids() {
+        // Shape matches a real SyncRequest hit, captured live from Carbonio
+        // CE (carbonio-core 4.5.14): token comes back as a string here, and
+        // `m` only needs `id` (the rest of the fields back a follow-up
+        // search by id).
+        let raw = r#"{
+            "Body": {
+                "SyncResponse": {
+                    "md": 1791941834,
+                    "m": [{"d": 1791941833000, "l": "5", "cid": "-295", "rev": 191, "md": 1791941833, "ms": 191, "id": "295"}],
+                    "token": "192"
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<SyncRequestBody> = serde_json::from_str(raw).unwrap();
+        let resp = envelope.body.sync_response.unwrap();
+        assert_eq!(sync_token_to_string(&resp.token).unwrap(), "192");
+        assert_eq!(resp.m.into_iter().map(|m| m.id).collect::<Vec<_>>(), vec!["295".to_string()]);
+    }
+
+    #[test]
+    fn sync_response_with_empty_m_means_nothing_changed() {
+        let raw = r#"{
+            "Body": { "SyncResponse": { "md": 1, "token": "190" } },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<SyncRequestBody> = serde_json::from_str(raw).unwrap();
+        let resp = envelope.body.sync_response.unwrap();
+        assert_eq!(sync_token_to_string(&resp.token).unwrap(), "190");
+        assert!(resp.m.is_empty());
+    }
+
+    #[test]
+    fn sync_response_token_as_a_bare_number_also_parses() {
+        // Confirmed live: the same SyncRequest call can come back with
+        // `token` as a bare JSON number instead of a quoted string,
+        // depending on the call (e.g. a baseline call with no `token` in
+        // the request). Both forms must parse.
+        let raw = r#"{
+            "Body": { "SyncResponse": { "md": 1, "token": 193 } },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<SyncRequestBody> = serde_json::from_str(raw).unwrap();
+        let resp = envelope.body.sync_response.unwrap();
+        assert_eq!(sync_token_to_string(&resp.token).unwrap(), "193");
+    }
+
+    #[test]
+    fn sync_request_fault_parses_must_resync() {
+        // Shape matches a real fault, captured live: an aged-out sync token
+        // comes back as this specific error code, not a generic failure.
+        let raw = r#"{
+            "Body": {
+                "Fault": {
+                    "Reason": {"Text": "sync token too old; tombstones have already been expired"},
+                    "Detail": {"Error": {"Code": "mail.MUST_RESYNC"}}
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<SyncRequestBody> = serde_json::from_str(raw).unwrap();
+        let fault = envelope.body.fault.expect("fault should be present");
+        assert_eq!(fault.detail.unwrap().error.code, "mail.MUST_RESYNC");
     }
 
     #[test]
