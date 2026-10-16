@@ -1,115 +1,137 @@
 # carbonio-ce-zpush
 
-ActiveSync (Exchange protocol) connector for **Zextras Carbonio CE**, being rewritten from the original PHP z-push + Zimbra backend into a standalone **Rust** server, dropping the PHP runtime dependency entirely.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
+[![Status](https://img.shields.io/badge/status-v1.0.0-brightgreen.svg)](CHANGELOG.md)
 
-Forked from [imanudin11/zimbra-zpush](https://github.com/imanudin11/zimbra-zpush) (PHP z-push with a Zimbra backend). All the original PHP code has been removed from this repo; everything here is the Rust rewrite (`rust/`). The PHP source is still available in the upstream repo if it's needed as a reference while porting a command this rewrite doesn't cover yet.
+An ActiveSync (Exchange protocol) connector for **Zextras Carbonio CE**, written in Rust. It lets ActiveSync clients (Android Mail/Gmail, iOS Mail, classic Outlook, and anything else that speaks EAS) sync email, contacts, and calendar against Carbonio CE without any PHP runtime on the mail server.
+
+Rewritten from scratch, inspired by [imanudin11/zimbra-zpush](https://github.com/imanudin11/zimbra-zpush) (the original PHP z-push with a Zimbra backend). None of the original PHP code lives in this repo; everything here is the Rust implementation in [`rust/`](rust/).
+
+## Why this exists
+
+The original z-push + Zimbra backend is roughly 100,000 lines of PHP, most of it for backends (Kopano, LDAP, CalDAV, CardDAV, maildir) this project never touches. Running it means a PHP runtime, a web server, and a vendored dependency tree living on the mail server just to speak one protocol.
+
+This project targets Carbonio CE specifically and ships as one static binary:
+
+- **No PHP on the host.** `cargo build` produces a single binary. Copy it to the server, run it, done.
+- **A binary WBXML parser reading untrusted bytes gets typed errors, not silent corruption.** Every ActiveSync command body is raw bytes from a phone or Outlook client. [`wbxml.rs`](rust/src/wbxml.rs) returns a `Result` at every decode step, so a truncated or malformed stream is something the caller has to handle, not a guess.
+- **The compiler catches codepage mismatches before a device does.** [`codepages.rs`](rust/src/codepages.rs) defines each WBXML tag once, and a test checks every encode/decode table agrees on the same token for the same tag name. A wrong tag code fails `cargo test`, not three weeks later when a specific client refuses to render Inbox.
+- **One process handles many devices without per-request process cost.** Tokio runs every open sync session as an async task in one process.
 
 ## Status
 
-Every ActiveSync command this project targets is implemented and verified end-to-end against a live Carbonio CE instance (`carbonio-core` 4.5.14). See [Known limitations](#known-limitations) below for what "implemented" doesn't cover yet.
+Feature-complete for the targeted MS-ASCMD command set and verified end-to-end against a real device (Android's Gmail and Calendar apps) through a public HTTPS reverse proxy, not just hand-built WBXML on localhost. See [CHANGELOG.md](CHANGELOG.md) for the full list of what's implemented, what got fixed along the way, and what's still a known limitation.
 
-- [x] TLS client to Carbonio's SOAP endpoint, with certificate pinning to work around Carbonio's default self-signed cert (5-year validity, rejected by both rustls/webpki and macOS Security.framework as exceeding the CA/Browser Forum's max leaf validity)
-- [x] `AuthRequest` (`urn:zimbraAccount`): login with a user's own credentials
-- [x] `GetFolderRequest` (`urn:zimbraMail`): fetch and flatten the mailbox folder tree
-- [x] WBXML codec (encode + decode), generic over codepage tables
-- [x] HTTP ActiveSync endpoint (`POST /Microsoft-Server-ActiveSync`): Basic Auth, `Cmd`/`User`/`DeviceId`/`DeviceType` query parsing
-- [x] `FolderSync` command: full round trip from device request, to Carbonio auth, to `GetFolderRequest`, to WBXML response. See below for its own real delta sync, added later
-- [x] `SearchRequest` (`urn:zimbraMail`): list messages in a folder, newest first
-- [x] `Sync` command for email: SyncKey "0" returns the current message list and a new key. A stale or unknown key returns Status 3 (invalid sync key, per MS-ASCMD 2.2.4), telling the device to sync again from scratch. See below for what happens when the device sends back its current key (this used to just mean "no changes", it doesn't anymore)
-- [x] `Provision`: accepts any device so clients that refuse to sync without it can get past the handshake. Does not enforce any EAS policy (no PIN, encryption, or remote wipe checks)
-- [x] `Ping`: genuinely blocks on Carbonio's own `WaitSetRequest` long-poll instead of replying instantly. Verified end-to-end: a real email sent mid-wait triggered a fast `Status 2` response (2.2s) instead of waiting out the full ~33s window Carbonio clamps the wait to. One important gotcha found along the way: a WaitSet created with an empty `add` list (binding "implicitly" to your own mailbox) looks successful but never actually reports a change -- the account id has to be listed explicitly in `add.a`, confirmed by comparing mailbox change-token growth (which kept advancing) against the WaitSet's own change list (which stayed empty) until that fix. Also worth knowing: Carbonio's own nginx front end 504s a single HTTP call that blocks past roughly 33-60s, so this issues one bounded wait per `Ping` rather than looping multiple waits inside one response
-- [x] Persistent SyncKey tracking, per (user, device, collection), snapshotted to a JSON file after every change (set `SYNC_STATE_PATH`) so a restart does not force every device into a fresh FolderSync. Verified across an actual process restart against the live server
-- [x] `SendMsgRequest` (`urn:zimbraMail`): send an email through Carbonio
-- [x] `SendMail` command: parses the device's raw RFC 822 body (headers + plain text, no multipart/MIME yet) and relays it to Carbonio. Verified end-to-end: sent a real message that landed in a live mailbox
-- [x] `Sync` command for contacts: same SyncKey machinery as email, backed by `SearchRequest types=contact`. `Sync` picks email vs. contacts per collection automatically by checking that folder's Carbonio `view` via `GetFolderRequest`. Verified end-to-end against a real contact (name, email, mobile number)
-- [x] `Sync` command for calendar events: backed by `SearchRequest types=appointment`. Only a recurring event's first occurrence is synced (no recurrence rule), and there are no attendees or reminders. Verified end-to-end: subject, location, start, and end time all matched a real appointment
-- [x] `GetItemEstimate`: returns a collection's item count straight from Carbonio's own per-folder count (`GetFolderRequest`'s `n` field), no need to fetch the items themselves to count them. Verified end-to-end against a real folder count
+Commands implemented: `FolderSync`, `Sync` (email, contacts, calendar, with real delta sync), `SendMail`, `Provision`, `Ping`, `GetItemEstimate`, `ItemOperations`/`Fetch`, `MoveItems`, `ResolveRecipients`, `Settings`, `Search`.
 
-Email, Contacts, and Calendar cover every item type this Carbonio CE instance actually has (see [Known limitations](#known-limitations) for why Tasks isn't here).
+## Installation
 
-- [x] `ItemOperations`/`Fetch` for email: fetches a message's plain-text body via `GetMsgRequest` and returns it under `Properties/Body`. Verified end-to-end: fetched a real message and got back its exact original body text
-- [x] `ItemOperations`/`Fetch` for attachments: a message with an attachment gets an `Attachments/Attachment` block in its `Sync` Add node (`DisplayName`/`FileReference`/`Method`/`EstimatedDataSize`/`ContentType`, under the real AirSyncBase codepage, see below), where `FileReference` is this project's own opaque `"<message_id>:<part_id>"` reference; only looked up (one extra `GetMsgRequest`) for messages the search result already flags as having an attachment, not every message. `Fetch`-ing that reference downloads the real bytes via Carbonio's REST `/service/content/get` and returns them base64-encoded under `Properties/Data` + `Properties/ContentType`, per MS-ASCMD's attachment Fetch schema. Verified end-to-end: synced a message with a real attachment, fetched it by the `FileReference` the Sync response gave, and the decoded bytes matched the original file exactly
-- [x] Along the way, found and fixed a real deserialization bug: `SearchRequest`'s `su` (subject) field comes back as a bare JSON string, not `{"_content": ...}` like most other text fields in Carbonio's SOAP-JSON. This went unnoticed because every earlier live `Sync` test happened to hit an empty Inbox, so the mismatched field was never actually exercised until a folder with real messages was synced
-- [x] HTML bodies and attachments in `SendMail`: `src/mime_lite.rs` now parses multipart MIME (nested `multipart/alternative`/`multipart/mixed`, quoted-printable and base64 decoding) instead of just a flat header/body split. Attachments are uploaded via Carbonio's REST `/service/upload` endpoint (not SOAP) and referenced by `aid` in `SendMsgRequest`; inlining attachment bytes directly in the SOAP `mp` tree was tried live and silently became a second body part instead of a real downloadable attachment, which is how this gap was found. Verified end-to-end: sent a message with an HTML part and a text attachment, both landed correctly (`cd: "attachment"`, real `filename`, no stray body part)
-- [x] `FolderSync`'s own SyncKey now uses the same `SyncStateStore` the `Sync` command uses, tracked under a fixed `__folder_hierarchy__` collection id (there's only one folder hierarchy per account, so it doesn't need a real collection id), and it's real delta sync too, same `SyncRequest`-based approach as email/contacts/calendar (see below). A new/renamed/deleted folder shows up on the next `FolderSync` with the current key, no reset to "0" needed. Anything else (a stale or unrecognized key) returns Status 9 (invalid sync key, MS-ASCMD 2.2.3.165.3). Found one more live quirk doing this: an account-wide `SyncRequest` baseline call (no token yet) wraps its whole folder tree under one synthetic root entry that has neither a name nor a parent id, which broke deserializing the entire response until those fields were made optional. Verified end-to-end across an actual process restart (state survives); a real new folder created mid-session showed up as an `Add` on the next `FolderSync` with the same key; and a deliberately stale key still returns Status 9 with the real current key
-- [x] `ItemOperations`/`Fetch` for Contacts and Calendar: looked up via dedicated single-item requests (`GetContactsRequest`/`GetAppointmentRequest`, `urn:zimbraMail`), not the list-shaped `SearchRequest` `Sync` already uses. `GetAppointmentRequest`'s useful fields turned out to be nested three levels down (`appt[0].inv[0].comp[0]`), unlike `SearchRequest`'s flat `name`/`loc`/`inst[]`, so this needed its own parsing. Verified end-to-end: fetched a real contact and a real calendar event by `ServerId`, both matched the original record field-for-field
-- [x] `Ping`'s Status 2 response now tells a device exactly which of its watched folders changed, not just that something did. Carbonio's `WaitSetRequest` itself can't say (confirmed live: a response is just `{id, changeid}` per account, no folder breakdown), so this uses a different signal: `GetFolderRequest`'s `i4ms` field is a per-folder modification counter that only advances when something inside that folder changes (confirmed live by sending a message and watching only its target folder's `i4ms` move, every other folder's stayed put). `handle_ping` snapshots `i4ms` for every watched folder before the wait and diffs it against a fresh snapshot after, and only the folders that actually moved go in the response's `Folders` list. If that diff ever comes back empty, or the second `GetFolderRequest` fails, it falls back to listing every watched folder (the old, always-safe behavior) rather than risk missing one. Verified end-to-end: watched Email, Contacts, and Calendar at once, created a calendar event mid-wait, and the response's `Folders` list contained only Calendar's folder id -- Email and Contacts weren't touched and correctly didn't appear
-- [x] `MoveItems`: moves every `<Move>` entry in a request (not just the first) to its own destination folder via Carbonio's `ItemActionRequest` (`op=move`), each getting its own `<Response>`, cross-checked against the original PHP z-push's `moveitems.php` (which loops the same way). Status codes use the real MS-ASCMD table (`3` = success), confirmed against `zpushdefs.php` -- this project had used its own made-up `1`/`2` pair before, which a real device checking for status `3` would have read as a permanent failure on every successful move. Verified end-to-end: moved two real messages from Inbox to Trash and back in one request, both came back Status `3`, same message ids on both sides since Carbonio doesn't renumber an item on move
-- [x] `ResolveRecipients`: resolves every requested `<To>` address (not just the first), looking each one up in both Carbonio's GAL (`SearchGalRequest`) and personal Contacts (`SearchRequest types=contact`) and merging every match from both into one `RecipientCount`/`Recipient` list, cross-checked against the original PHP z-push's Zimbra backend (which does the same two-source lookup). An address with no match in either source now gets Status 4 (unresolved), not treated as resolved to itself like this project did before. Found a real bug along the way: searching the GAL with `type: "all"` (needed to match non-account entries, not just `type: "account"`) can return a multi-valued attribute like `objectClass` as a JSON array, which broke deserializing the whole response until `_attrs` was made tolerant of that. Verified end-to-end: resolved one address via GAL (`Type` 1), one via a personal contact (`Type` 2), and one with no match anywhere came back Status 4 as expected, all in a single multi-address request
-- [x] `Settings`: a `DeviceInformation` `Set` is acknowledged without being stored anywhere, and an `Oof` `Get` always answers "out of office is off". Enough for a device that refuses to finish its handshake without a `Settings` round trip, with no real per-device info storage or Oof message editing. Verified end-to-end against the live server, no Carbonio call needed since both responses are static
-- [x] `Search`: a flat free-text search across the whole mailbox via `SearchRequest` with no `inid` folder scope, matching MS-ASCMD's basic `Search` semantics. No boolean query trees (`And`/`Or`/`LessThan`/etc.), no GAL search, Store must be "Mailbox". Verified end-to-end: searching for a word from a real message's subject returned that message's `ServerId`, subject, and sender
-- [x] Real delta sync for email, contacts, calendar events, and the folder hierarchy itself, using Carbonio's own `SyncRequest` (`urn:zimbraMail`) instead of a naive "SyncKey 0 or bust" model. A collection's (or `FolderSync`'s) SyncKey is now literally Carbonio's own sync token, not a counter this project invented: the first Sync/FolderSync seeds it, and every one after that calls `SyncRequest` with that same token to ask Carbonio directly what changed, fetching full details only for the ids that actually did (one `item:{id1,id2,...}` search for email, one `GetContactsRequest`/`GetAppointmentRequest` per id for contacts/calendar, and the folder entries `SyncRequest` already returns directly for `FolderSync`). A device no longer has to reset to SyncKey "0" to see new mail, a contact edit, a new event, or a new folder. Found four live gotchas doing this: `SyncResponse.token` comes back as a bare JSON number on some calls and a quoted string on others (same inconsistency already worked around for `WaitSetRequest`'s `seq`); an aged-out token comes back as a specific `mail.MUST_RESYNC` fault, treated as a real outcome (fall back to Status 3/9) rather than an error; a folder-scoped `SyncRequest` puts a changed item under a *different* field depending on its type (`m` for messages, `cn` for contacts, `appt` for events), not one unified list, which was a real bug caught live when a changed contact silently produced an empty delta; and an account-wide baseline `SyncRequest` (used to seed `FolderSync`'s token) wraps its folder tree under one synthetic root with no name or parent id, which broke deserializing the whole response until those fields were made optional. Verified end-to-end for all four: seeded a SyncKey/FolderSync key, created a real contact/event/folder or sent a real email, synced again with the *same* key, and each one came back as a real `Add` node with an advanced key, no reset to "0" anywhere in between
+### Requirements
 
-Everything else from the original z-push (non-Carbonio backends, admin CLI tooling, legacy IPC state machines, decade-old device compatibility quirks) is intentionally **not** being ported. This project targets Carbonio CE specifically, not generic ActiveSync server building.
+- A running Carbonio CE instance you have SOAP/HTTPS access to.
+- [Rust](https://www.rust-lang.org/tools/install) (stable toolchain) to build from source. There are no prebuilt binaries yet, so you build this directly on (or for) the machine that will run it.
+- The machine running this server needs network access to Carbonio's SOAP endpoint, and ActiveSync clients need HTTPS access to this server (see [Exposing it to real devices](#exposing-it-to-real-devices) below if you don't already have TLS in front of it).
 
-## Known limitations
-
-These are real, understood gaps, not TODOs that got skipped by accident:
-
-- **The WBXML codepage tables have now been cross-checked against the original PHP z-push's own `lib/wbxml/wbxmldefs.php`** (the project this was rewritten from), not just reproduced from memory. That check found and fixed real bugs: every `GetItemEstimate` token was off by one (it would have failed against any real device); `ResolveRecipients`'s `To` and `Settings`'s `DeviceInformation` were on self-invented tokens that collided with real, differently-named fields; `Search`'s result `Properties` was wrongly routed through the `ItemOperations` codepage instead of `Search`'s own; and `ItemOperations`'s `ServerId`/`CollectionId` were self-contained instead of the real AirSync-codepage tokens a real device actually sends, which also meant the decoder couldn't have understood a real device's request. All of these were verified live against Carbonio after the fix, including a hand-built request that page-switches to AirSync for `ServerId` the way a real device would.
-- **Added a real AirSyncBase codepage** (0x11, since EAS 12.0), the modern home for email bodies and attachments. Email's attachment list (in a `Sync` Add node), `ItemOperations`'s message-body `Fetch`, and its attachment `Fetch` (`FileReference`/`ContentType`/`Data`) all used to go through either the deprecated pre-12.0 Email-codepage fields or self-contained placeholder tokens; all three now use AirSyncBase's real tokens instead. Verified end-to-end with hand-built WBXML that page-switches between codepages the way a real device would: sent a message with a real attachment, Synced it and got back an AirSyncBase-coded attachment entry, fetched the body (AirSyncBase `Body`) and the attachment (AirSyncBase `FileReference`/`ContentType`/`Data`), and both matched the originals exactly.
-- **Now tested against a real device** (Android's Gmail app, over the public internet through a real reverse proxy, not hand-built WBXML on localhost). That found and fixed real bugs no amount of hand-built WBXML testing surfaced, because this project's own test requests never matched what a real client actually sends:
-  - **No `OPTIONS` handshake.** Every real EAS client sends `OPTIONS` to this endpoint before ever attempting a `POST`, to check `MS-ASProtocolVersions`/`MS-ASProtocolCommands` (MS-ASHTTP 3.1.5.1). This project's router only had a `POST` route, so `OPTIONS` came back a bare `405` with none of those headers -- confirmed live as the reason a real device's setup screen failed with *no request ever reaching this server's logs*, while this project's own `POST`-only test scripts (which skip the `OPTIONS` probe) had worked the whole time and completely masked the gap.
-  - **`BodyPreference` wasn't decodable, and `Sync` couldn't even reach AirSyncBase at all.** A real `Sync` request's `Options` block always includes `BodyPreference`/`Type`/`TruncationSize` (to say what body format/truncation size a client wants), which this project's own hand-built `Sync` test bodies never included. `AIRSYNCBASE_TAGS` didn't define those tokens, *and* `handle_sync`'s decode table was never merged with AirSyncBase's at all, so a real device's `Sync` request failed to decode outright, logged live as `unknown tag token 0x05 on codepage 17`.
-  - **Fetching attachment metadata silently marked messages read, and that fed back into a permanent resync loop.** `get_message_details` (called from `Sync` just to check whether a message has attachments) uses `GetMsgRequest`, which marks a message read by default unless told not to. That incidental read-marking bumped the folder's own change counter, which made `FolderSync`'s delta sync think the folder hierarchy kept changing, which reset every collection's SyncKey back to "0" on every single poll -- confirmed live as a real device stuck in permanent full-resync, flickering its own UI every few seconds and never reaching a quiet steady state. Fixed with `markRead: "0"` on that call; read status should only change because a device explicitly asks for it (not implemented), never as a side effect of this project's own internal lookups.
-  - **Every mail folder was reported as the default Inbox.** `activesync_folder_type` only looked at a folder's `view`, so every `view="message"` folder (Inbox, Sent, Drafts, Trash, Junk, Archive, custom folders, all of them) got ActiveSync folder type `2`, which specifically means "the one true default Inbox" (MS-ASCMD 2.2.3.165.1, cross-checked against the original PHP z-push's `zpushdefs.php`). A real device doesn't expect more than one folder claiming to be the default Inbox; a mature EAS client (Gmail) visibly could not settle into a steady state with a folder list this self-contradictory. Fixed using Carbonio's own fixed system-folder ids (`2`=Inbox, `3`=Trash, `5`=Sent, `6`=Drafts, `7`=Contacts, `10`=Calendar -- the same ids on every account), confirmed live: after the fix, the same device stopped resyncing all 12 folders every few seconds and settled into syncing just the handful it actually cares about, with a stable SyncKey reused correctly across polls.
-  
-  All four verified end-to-end with the same real device: real data landed (a real `Sync` returned a live Inbox's messages), a real email was composed and sent from the phone through this server to Carbonio (`SendMail` returned `200`), and the account reached a genuinely stable polling state instead of looping.
-- **`ResolveRecipients` and `MoveItems`'s multi-entry/status-table gaps are now closed** (see above). What's still deliberately simplified:
-  - `Settings` doesn't store anything: a `DeviceInformation` `Set` is acknowledged and dropped, and `Oof` `Get` always answers "out of office is off" with no way to actually turn it on. Checked whether Carbonio's own `zimbraPrefOutOfOfficeReply*` preferences could back a real `Oof` `Set`/`Get` (the original PHP z-push's Zimbra backend does exactly that via `ModifyPrefsRequest`), and confirmed this is a genuine platform restriction, not a wrong API call: `zmprov` (admin, over SSH) sets `zimbraPrefOutOfOfficeReply` and `zimbraPrefOutOfOfficeReplyEnabled` and the values persist and read back correctly; the self-service `ModifyPrefsRequest` call this project would actually use returns HTTP 200 with no fault for the exact same attributes, but the values silently never change, tried twice including flipping `Enabled` from `TRUE` to `FALSE`. Reading the same prefs back via `GetInfoRequest` works fine either way. So this account can read Oof state and an admin can write it, but the account can't write its own -- the same shape as the Tasks gap elsewhere in this README: the feature exists in Carbonio CE, self-service write to it doesn't, most likely gated to the paid Advanced tier. Nothing left to fix here from this project's side; reporting an Oof state it can't actually let the user change would be worse than reporting none.
-  - `Provision` accepts any device and enforces no EAS policy at all (no PIN, encryption, or remote wipe).
-  - Calendar sync only carries a recurring event's first occurrence, with no recurrence rule, attendees, or reminders.
-- **No Tasks support**, but this isn't a gap in the rewrite: this Carbonio CE build has no Tasks folder at all, and rejects `SearchRequest types=task` outright (`invalid item type: task`). Tasks appears to be a Carbonio Advanced (paid) feature.
-- **"New Outlook" (current Outlook for Mac/Windows) doesn't work with this server, and can't be made to**, confirmed live: it sends `GET /EWS/Exchange.asmx`, never `/Microsoft-Server-ActiveSync`, no matter what's entered in its "Exchange" account setup screen (including a manual server/port). New Outlook defaults to EWS (Exchange Web Services, a completely different SOAP-based protocol) and doesn't fall back to ActiveSync for a server that only speaks ActiveSync. Implementing EWS is a different, much larger protocol than this project's own scope, not a bug fix. Classic/legacy Outlook, Android's Gmail app (confirmed live, see above), and iOS Mail's "Exchange" account type all speak real ActiveSync and are the right clients to test with instead.
-- **Fixed: `SendMail`'s body went missing on a real device, because this project assumed `SendMail`'s entire POST body was raw RFC 822 text.** It isn't, for a real EAS 14.0+ client. Android's Gmail app wraps the RFC 822 message in a WBXML envelope on the `ComposeMail` codepage (0x15), with the message itself embedded as `OPAQUE` binary content inside a `MIME` element, confirmed by capturing and hand-decoding the exact bytes a real `SendMail` request sent (its WBXML header `03 01 6a 00...` is never valid RFC 822, which real headers like `To:`/`Date:` always start with). This project's old naive `parse_rfc822(body)` call, run directly on the whole WBXML-wrapped body, happened to find the right header block anyway, but picked up trailing WBXML end-of-element bytes as part of the body text, which silently broke the base64 decode and produced an empty body. Fixed by adding real `OPAQUE` support to the WBXML decoder/encoder, a `ComposeMail` codepage, and an `extract_sendmail_rfc822` step that unwraps the envelope first (falling back to treating the whole body as raw RFC 822 when there's no WBXML wrapper, for this project's own hand-built test scripts and any client that still posts raw RFC 822 directly). Verified with a regression test using the exact captured bytes, and redeployed to the live server.
-- **Fixed: top-level folders (Inbox, Sent, Drafts, Trash, Calendar, Contacts, Archive, custom folders) never showed up in a real device's folder list**, even though `Sync`/`FolderSync` were otherwise working. `get_folders` (and the delta path, `sync_folders_since`) reported every top-level folder's `ParentId` as Carbonio's own real root folder id (`"1"`, `"USER_ROOT"`), but MS-ASCMD's `ParentId` (2.2.3.167.1) uses the synthetic `"0"` for "no parent, top level", and that real root id `"1"` is never itself sent to the device as an `Add` node. A real device can't place a folder whose parent it can't resolve, so Gmail silently dropped every single one, confirmed live against the actual `GetFolderResponse` tree (root id `"1"`, every top-level folder's `l` also `"1"`). Fixed by mapping the real root id to `"0"` for top-level folders in both the full and delta folder-sync paths, with regression tests covering both.
-- **Fixed: a real device's "mark message read" push 400'd outright, which could stall its own sync pipeline instead of just failing silently.** Opening (or marking read/unread) a message on the phone sends a `Sync` `Commands/Change` entry switching to the Email codepage for an `Email:Read` flag, which `handle_sync`'s decode table never included (only AirSync + AirSyncBase), logged live as `unknown tag token 0x15 on codepage 2`. A repeatedly-400ing push left the device retrying the same failed request instead of moving on, which also looked like "new mail isn't arriving" even though the mail had already landed in Carbonio. Fixed by merging the Email codepage into `handle_sync`'s decode table and actually applying the read/unread change via a new `ItemActionRequest op=read`/`op=!read` call, confirmed with a regression test using the exact captured bytes.
-- **Fixed: synced emails always showed up on the device with no body at all.** `email_to_add_node` only ever fetched a message's details (and therefore only ever attached an AirSyncBase `Body` block) for messages already flagged as having an attachment; everything else synced with `Subject`/`From`/`Read` and nothing else. A real device (confirmed live with Android Gmail) never issues its own `ItemOperations`/`Fetch` to read a message it already has from `Sync` -- it expects the body inline in `Sync`'s own `Add` node. Fixed by fetching message details unconditionally and always attaching AirSyncBase's `Body` (`Type`/`EstimatedDataSize`/`Truncated`/`Data`), with the relevant tag names routed to the AirSyncBase codepage in the Sync response encoder the same way the attachment list already was.
-- **Fixed: some synced emails still had a body, others didn't, even after the fix above** -- confirmed live, inconsistent per message rather than universally broken. `get_message_details` trusted whichever MIME leaf Carbonio itself flagged `body: true`, but this project's own `send_message` always builds `multipart/alternative` with the plain-text part first, so an originally HTML-only `SendMail` (no real plain-text fallback) ends up with its *empty* plain-text part flagged as `body`, while the real content sits right next to it in the html part. Any message whose plain part happened to have real content (or that never went through this project's own HTML-only `SendMail` path) worked fine; the rest silently got an empty body. Fixed by preferring the flagged part only when it actually has content, falling back to any non-empty plain-text or html leaf otherwise, and setting AirSyncBase `Body`'s `Type` to 2 (HTML) instead of always 1 (plain text) when the chosen body is HTML. Regression tests cover both the flagged-but-empty case and the plain-fallback case.
-- **Fixed: even with the fallback above, an html-only message's body still came back empty** -- the html part's `content` wasn't just unflagged, Carbonio was leaving it out of `GetMsgRequest`'s response entirely by default, confirmed live by fetching the same message with and without an extra parameter: without it, the html part comes back as `{"part": "2", "ct": "text/html", "s": 36}`, no `content` key at all; with `html: "1"` on the request, Carbonio flips which part it flags `body` and inlines, so the html part gets `content`/`body: true` and the plain part's `content` is the one left out instead. `pick_body_part`'s fallback logic from the fix above was correct; there was simply no content anywhere in the response to fall back to. Fixed by always passing `html: "1"` on `GetMsgRequest`.
-- **Fixed: creating a calendar event on the device never created anything in Carbonio.** `handle_sync` processed the device's own `Change` entries (read/unread, see above) but never its `Commands/Add` entries at all, for any collection kind -- so a client-created event's `Add` just vanished, while this project's old code still answered `Status 1` with no `Responses` block, meaning the device believed the create had succeeded and never retried it. Confirmed live creating a real event in Android's Calendar app: nothing showed up in Carbonio, and nothing in this server's own logs showed the request being rejected either, since it wasn't rejected, just silently dropped. Fixed by decoding the event's `Subject`/`Location`/`StartTime`/`EndTime` from the `Add`'s `ApplicationData` (merging the Calendar codepage into `handle_sync`'s decode table, which wasn't there before either) and creating it via a new `CreateAppointmentRequest` call, then echoing the device's `ClientId` back with the new item's real `ServerId` in a `Responses` block per MS-ASCMD 2.2.3.28 so the device can reconcile its local placeholder. `CreateAppointmentRequest` needs the date fields as `d` (date string), not `u` (epoch ms) -- confirmed live, `u` alone hard-fails with `invalid request: missing required attribute: d` -- which conveniently is exactly the format this project's own AS datetime strings (`format_activesync_datetime`'s `YYYYMMDDTHHMMSSZ` shape) already come in, so they're passed straight through unparsed. **Note:** an event created on the device before this fix is unrecoverable from the server side -- the device already marked it synced (since the old code never told it otherwise) and won't resend it, so it needs to be re-created on the phone now that `Add` is actually handled.
-- **Fixed: the real device's own calendar event push 400'd outright too, so the fix above still didn't work until this landed as well.** The Calendar codepage (above) only ever defined the five fields this project needed to *read* in the other direction; a real device's own client-created event (confirmed live with Android's Calendar app) carries several more in the same `ApplicationData` block -- `Timezone` (a base64 blob), `DtStamp`, `OrganizerEmail` (matching the sending account), `BusyStatus`, `Reminder`, `Sensitivity`, `UID` -- and a single unknown token anywhere aborts the whole message's decode, logged live as `unknown tag token 0x05 on codepage 4`. Fixed by adding all of them to the Calendar codepage (even though this project only acts on `Subject`/`Location`/`StartTime`/`EndTime`), confirmed with a regression test using the exact captured bytes.
-
-## Building and running
+### 1. Clone and build
 
 ```bash
-cd rust
-cargo build
-cargo test
+git clone https://github.com/afatyoo/carbonio-ce-zpush.git
+cd carbonio-ce-zpush/rust
+cargo build --release
 ```
 
-Run the server:
+The binary lands at `target/release/carbonio-ce-zpush`. Run `cargo test` first if you want to confirm the build is healthy on your machine; it needs no network access or live Carbonio instance.
+
+### 2. Get Carbonio's TLS certificate
+
+Carbonio CE ships a self-signed certificate with a 5-year validity period, which both `rustls`/`webpki` and macOS's `Security.framework` reject as exceeding the CA/Browser Forum's maximum leaf certificate lifetime. Pick **one** of these:
+
+**Pinning mode** (works around the validity-period rejection, the common case for Carbonio's own self-signed cert):
+
+```bash
+mkdir -p certs
+scp root@<your-carbonio-host>:/opt/zextras/ssl/carbonio/server/server.crt certs/server.pem
+```
+
+**CA-chain mode** (if Carbonio is behind a certificate your system already trusts, or you've replaced its self-signed cert):
+
+```bash
+mkdir -p certs
+scp root@<your-carbonio-host>:/opt/zextras/ssl/carbonio/ca/ca.pem certs/ca.pem
+```
+
+Certificates are not committed to this repo (`rust/certs/*.pem` is gitignored, since it identifies your server) — fetch them from your own Carbonio host as shown above.
+
+### 3. Configure and run
 
 ```bash
 export CARBONIO_URL="https://<your-carbonio-host>"
-export LISTEN_ADDR="0.0.0.0:7272"          # default shown
+export LISTEN_ADDR="0.0.0.0:7272"                    # default shown; change the port if needed
 
-# TLS trust, pick ONE:
-export CARBONIO_CA_PEM="certs/ca.pem"               # normal CA-chain validation
-# or, if Carbonio's self-signed cert is rejected for validity-period reasons:
-export CARBONIO_PINNED_CERT="certs/server.pem"       # exact-byte-match pinning
+# TLS trust: match whichever certificate you fetched in step 2
+export CARBONIO_PINNED_CERT="certs/server.pem"       # pinning mode
+# export CARBONIO_CA_PEM="certs/ca.pem"              # CA-chain mode (use this one instead if you went that route)
 
-# only needed if Carbonio's cert names a hostname with no real DNS record:
+# Only needed if Carbonio's certificate names a hostname with no real DNS record for it:
 export CARBONIO_TLS_HOSTNAME="ce-example.yourdomain.com"
 export CARBONIO_TLS_IP="192.168.x.x"
 
-cargo run
+# Optional: persist SyncKeys across restarts, so devices don't get forced into a fresh resync every time this restarts.
+export SYNC_STATE_PATH="sync_state.json"
+
+./target/release/carbonio-ce-zpush
 ```
 
-Optional: `export SYNC_STATE_PATH="sync_state.json"` to persist SyncKeys across restarts. Without it, state is in-memory only and every device starts from a fresh FolderSync whenever the process restarts.
-
-Certificates are not committed (`rust/certs/*.pem` is gitignored, since it's server-identifying material). Copy them from the Carbonio host yourself, e.g.:
+Once it's running, confirm it answers on the ActiveSync path:
 
 ```bash
-# CA-chain mode:
-scp root@<carbonio-host>:/opt/zextras/ssl/carbonio/ca/ca.pem rust/certs/ca.pem
-# Pinning mode (needed when the CA mode above fails validity-period checks):
-scp root@<carbonio-host>:/opt/zextras/ssl/carbonio/server/server.crt rust/certs/server.pem
+curl -i -X OPTIONS http://localhost:7272/Microsoft-Server-ActiveSync
 ```
 
-## Real-device testing setup
+A healthy response includes `MS-ASProtocolVersions` and `MS-ASProtocolCommands` headers.
 
-Verifying against a real client needs HTTPS reachable from the public internet, which this server doesn't provide on its own (`src/main.rs` only binds plain HTTP). The setup used for the live testing above:
+### 4. Run it as a service
+
+For anything beyond local testing, run the binary under a process supervisor so it survives reboots and crashes. A minimal `systemd` unit:
+
+```ini
+[Unit]
+Description=carbonio-ce-zpush ActiveSync connector
+After=network.target
+
+[Service]
+ExecStart=/opt/carbonio-ce-zpush/carbonio-ce-zpush
+Environment=CARBONIO_URL=https://your-carbonio-host
+Environment=CARBONIO_PINNED_CERT=/opt/carbonio-ce-zpush/server.pem
+Environment=LISTEN_ADDR=0.0.0.0:7272
+Environment=SYNC_STATE_PATH=/opt/carbonio-ce-zpush/sync_state.json
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Save it as `/etc/systemd/system/carbonio-ce-zpush.service`, then:
+
+```bash
+systemctl daemon-reload
+systemctl enable --now carbonio-ce-zpush
+systemctl status carbonio-ce-zpush
+```
+
+### 5. Point a device at it
+
+ActiveSync clients expect HTTPS, and this server only speaks plain HTTP on `LISTEN_ADDR` — it expects a reverse proxy to terminate TLS in front of it. See [Exposing it to real devices](#exposing-it-to-real-devices) below for the setup this project was tested against. Once that's in place, add an "Exchange"/"ActiveSync" account on the device with:
+
+- **Server**: your reverse proxy's public hostname
+- **Username / Email**: the Carbonio account's own address
+- **Password**: the Carbonio account's own password
+
+## Exposing it to real devices
+
+ActiveSync clients require HTTPS, which this server doesn't terminate itself (`LISTEN_ADDR` is plain HTTP only, on purpose — TLS termination is a reverse proxy's job, not this project's). The setup this was verified against:
 
 ```
 Real device (Gmail app, etc.)
@@ -119,11 +141,11 @@ Real device (Gmail app, etc.)
   -> this server's plain-HTTP LISTEN_ADDR, on the private network with Carbonio
 ```
 
-- A public host runs nginx with a `certbot`-issued cert for a subdomain pointing at it, reverse-proxying `/Microsoft-Server-ActiveSync` to this server's WireGuard tunnel address.
-- This server joins that host's existing WireGuard network as a client (`PersistentKeepalive`, since it's the side behind NAT), so the public host can reach it without exposing the private network directly.
-- This server itself still just runs as a normal `systemd` service on plain HTTP, same as [Building and running](#building-and-running) below; the reverse proxy is the only thing handling TLS.
+- A public-facing host runs nginx with a `certbot`-issued certificate for a subdomain, reverse-proxying `/Microsoft-Server-ActiveSync` to this server's address.
+- This server reaches that host over a WireGuard tunnel (as the client side, with `PersistentKeepalive` if it's behind NAT), so the public host can reach it without exposing your private network directly.
+- This server itself keeps running as a normal plain-HTTP service, same as [step 3](#3-configure-and-run) above — the reverse proxy is the only thing handling TLS.
 
-None of this is specific to Carbonio or this project; it's the standard shape for exposing any internal HTTP service to a real ActiveSync client without the server needing its own public IP or TLS cert.
+None of this is specific to Carbonio or this project; it's the standard shape for exposing any internal HTTP service to a real ActiveSync client without that service needing its own public IP or certificate.
 
 ## Architecture
 
@@ -132,22 +154,16 @@ None of this is specific to Carbonio or this project; it's the standard shape fo
 | `src/carbonio.rs` | SOAP/JSON client to Carbonio CE (`urn:zimbraAccount`, `urn:zimbraMail`) |
 | `src/tls_pinning.rs` | Custom `rustls` certificate verifier for pinned-cert mode |
 | `src/wbxml.rs` | WBXML binary codec (encode/decode), codepage-table driven |
-| `src/codepages.rs` | WBXML codepage token tables (AirSync, Email, Contacts, Calendar, FolderHierarchy, ItemEstimate, ItemOperations, Ping, Provision, Move, ResolveRecipients, Search, Settings, AirSyncBase) and Carbonio→ActiveSync folder type mapping |
+| `src/codepages.rs` | WBXML codepage token tables (AirSync, Email, Contacts, Calendar, FolderHierarchy, ItemEstimate, ItemOperations, Ping, Provision, Move, ResolveRecipients, Search, Settings, AirSyncBase, ComposeMail) and Carbonio→ActiveSync folder type mapping |
 | `src/sync_state.rs` | SyncKey store, per (user, device, collection), with optional JSON-file persistence |
 | `src/mime_lite.rs` | RFC 822 + MIME multipart parser for `SendMail` bodies (plain/HTML/attachments) |
 | `src/activesync_http.rs` | ActiveSync HTTP framing: Basic Auth header, `Cmd`/`User`/`DeviceId`/`DeviceType` query parsing |
-| `src/server.rs` | `axum` HTTP server, command dispatch (`FolderSync`, `Sync`, `Provision`, `Ping`, `SendMail`, `GetItemEstimate`, `ItemOperations`, `MoveItems`, `ResolveRecipients`, `Settings`, `Search`) |
+| `src/server.rs` | `axum` HTTP server, command dispatch |
 
-## Why Rust
+## Contributing
 
-The original z-push + Zimbra backend is about 100,000 lines of PHP, split across the z-push core and backends for Kopano, LDAP, CalDAV, CardDAV, and maildir that this project never touches. We are not porting that. We are rewriting the ActiveSync protocol layer and a Carbonio-specific backend from scratch, and Rust fits this specific job for four reasons:
+Bug reports, fixes, and new MS-ASCMD commands are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request, and note that everyone participating in this project is expected to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
-**No PHP on the host.** That was the original ask: stop installing a PHP runtime, a web server, and a vendor tree on the mail server just to speak ActiveSync. `cargo build` produces one static binary. Copy it to the server, run it, done. No php-fpm, no Composer, no Apache or nginx config dedicated to z-push.
+## License
 
-**WBXML is a binary protocol parsed from untrusted input.** Every ActiveSync command body is raw bytes from a phone or Outlook client, and the parser has to walk tag tokens, codepage switches, and length-prefixed strings by hand. In PHP, a malformed byte sequence can corrupt state silently or crash the worker. In Rust, `wbxml.rs` returns a `Result` at every decode step, so a truncated or hostile WBXML stream is a typed error the caller has to handle, not a guess.
-
-**The compiler catches protocol mismatches before a device does.** `codepages.rs` defines each WBXML tag once, and a test (`all_tables_round_trip_token_name_lookups`) checks that every encode table and decode table agree on the same token for the same tag name. Get a tag code wrong and the test fails at `cargo test`, not three weeks later when a specific iPhone build refuses to render Inbox.
-
-**One process handles many devices without the PHP-FPM cost.** Every connected phone holds a sync session open. PHP-FPM's model is one process or thread per request. Tokio runs all of those sessions as async tasks in one process, so the number of devices scales without scaling worker processes.
-
-The command set this project targets is now in place; what's left is testing it against a real client instead of hand-built WBXML, as noted in [Known limitations](#known-limitations).
+[MIT](LICENSE) © Muhammad Afatyo Ikhsan
