@@ -1276,11 +1276,22 @@ impl CarbonioClient {
             .as_deref()
             .context("get_message_details called before authenticate")?;
 
+        // `html: "1"` matters, not just a nice-to-have: without it,
+        // confirmed live, Carbonio only inlines `content` for whichever
+        // part it flags `body` (the plain-text part by default), and
+        // genuinely omits the html part's `content` field entirely rather
+        // than sending it empty -- so for an html-only message (no real
+        // plain-text fallback), there is no body content anywhere in the
+        // response at all to fall back to, regardless of how
+        // `pick_body_part` picks between parts. With `html: "1"`,
+        // Carbonio flips which part it flags `body` and inlines: the html
+        // part gets `content` and `body: true`, and the plain part's
+        // `content` is the one left out instead.
         let request_body = json!({
             "Body": {
                 "GetMsgRequest": {
                     "_jsns": "urn:zimbraMail",
-                    "m": { "id": message_id, "markRead": "0" }
+                    "m": { "id": message_id, "markRead": "0", "html": "1" }
                 }
             },
             "Header": {
