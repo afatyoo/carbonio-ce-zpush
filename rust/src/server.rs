@@ -569,7 +569,7 @@ async fn email_to_add_node(client: &CarbonioClient, m: &crate::carbonio::Carboni
             children: vec![
                 WbxmlNode::Tag {
                     name: "Type".into(),
-                    children: vec![WbxmlNode::Text("1".into())],
+                    children: vec![WbxmlNode::Text(if details.is_html { "2" } else { "1" }.into())],
                 },
                 WbxmlNode::Tag {
                     name: "EstimatedDataSize".into(),

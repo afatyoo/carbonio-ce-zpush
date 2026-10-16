@@ -1327,13 +1327,9 @@ impl CarbonioClient {
 
         let mut leaves = Vec::new();
         collect_leaf_parts(&message.mp, &mut leaves);
-        let body = leaves
-            .into_iter()
-            .find(|part| part.body && part.ct == "text/plain")
-            .map(|part| part.content)
-            .unwrap_or_default();
+        let (body, is_html) = pick_body_part(&leaves);
 
-        Ok(MessageDetails { body, attachments })
+        Ok(MessageDetails { body, is_html, attachments })
     }
 
     /// Downloads one attachment's raw bytes via the REST
@@ -1656,11 +1652,42 @@ fn collect_leaf_parts(parts: &[RawMimePart], out: &mut Vec<RawMimePart>) {
     }
 }
 
-/// A message's plain-text body plus its attachment list, from
-/// [`CarbonioClient::get_message_details`].
+/// Picks the best body leaf to show a device, and whether it's HTML.
+///
+/// The leaf Carbonio itself flags `body: true` is *not* always the right
+/// one to trust blindly: this project's own `send_message` always builds
+/// `multipart/alternative` with the plain-text part first, and Carbonio
+/// flags whichever part comes first as `body` regardless of whether it
+/// has real content -- so a message built from an originally HTML-only
+/// `SendMail` (no real plain-text fallback) ends up with its *empty*
+/// plain-text part flagged as the body, while the real content sits in
+/// the html part right next to it, confirmed live: some synced messages
+/// had a body, others didn't, depending on whether the original message
+/// happened to have a non-empty plain-text part at all. Preferring the
+/// flagged part only when it actually has content, then falling back to
+/// any non-empty plain-text or html leaf, fixes that for both this
+/// project's own sent mail and any external HTML-only message.
+fn pick_body_part(leaves: &[RawMimePart]) -> (String, bool) {
+    if let Some(flagged) = leaves.iter().find(|p| p.body && !p.content.is_empty()) {
+        return (flagged.content.clone(), flagged.ct == "text/html");
+    }
+    if let Some(plain) = leaves.iter().find(|p| p.ct == "text/plain" && !p.content.is_empty()) {
+        return (plain.content.clone(), false);
+    }
+    if let Some(html) = leaves.iter().find(|p| p.ct == "text/html" && !p.content.is_empty()) {
+        return (html.content.clone(), true);
+    }
+    (String::new(), false)
+}
+
+/// A message's body (plain-text or HTML, see [`pick_body_part`]) plus its
+/// attachment list, from [`CarbonioClient::get_message_details`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageDetails {
     pub body: String,
+    /// True when `body` is HTML (AirSyncBase `Type` 2) rather than
+    /// plain text (`Type` 1); see [`pick_body_part`].
+    pub is_html: bool,
     pub attachments: Vec<AttachmentRef>,
 }
 
@@ -2741,6 +2768,38 @@ mod tests {
         collect_leaf_parts(&message.mp, &mut leaves);
         let body = leaves.into_iter().find(|p| p.body && p.ct == "text/plain").map(|p| p.content);
         assert_eq!(body, Some("Plain fallback text".to_string()));
+    }
+
+    #[test]
+    fn pick_body_part_prefers_the_flagged_leaf_when_it_has_content() {
+        let leaves = vec![
+            RawMimePart { part: "1.1".into(), ct: "text/plain".into(), body: true, content: "Plain fallback".into(), cd: String::new(), filename: String::new(), s: 0, mp: Vec::new() },
+            RawMimePart { part: "1.2".into(), ct: "text/html".into(), body: false, content: "<p>HTML</p>".into(), cd: String::new(), filename: String::new(), s: 0, mp: Vec::new() },
+        ];
+        assert_eq!(pick_body_part(&leaves), ("Plain fallback".to_string(), false));
+    }
+
+    #[test]
+    fn pick_body_part_falls_back_to_html_when_the_flagged_plain_leaf_is_empty() {
+        // Confirmed live: this project's own `send_message` always builds
+        // `multipart/alternative` with the plain part first, so an
+        // originally HTML-only message (no real plain-text fallback) ends
+        // up with its *empty* plain part flagged as `body` by Carbonio,
+        // while the real content sits right next to it in the html part.
+        // Trusting the flag blindly here is exactly what synced some
+        // messages with no body at all while others (ones with a real
+        // non-empty plain part) worked fine.
+        let leaves = vec![
+            RawMimePart { part: "1.1".into(), ct: "text/plain".into(), body: true, content: String::new(), cd: String::new(), filename: String::new(), s: 0, mp: Vec::new() },
+            RawMimePart { part: "1.2".into(), ct: "text/html".into(), body: false, content: "<div dir='auto'>halloooo</div>".into(), cd: String::new(), filename: String::new(), s: 41, mp: Vec::new() },
+        ];
+        assert_eq!(pick_body_part(&leaves), ("<div dir='auto'>halloooo</div>".to_string(), true));
+    }
+
+    #[test]
+    fn pick_body_part_returns_empty_when_every_leaf_is_empty() {
+        let leaves = vec![RawMimePart { part: "1".into(), ct: "text/plain".into(), body: true, content: String::new(), cd: String::new(), filename: String::new(), s: 0, mp: Vec::new() }];
+        assert_eq!(pick_body_part(&leaves), (String::new(), false));
     }
 
     #[test]
