@@ -3,7 +3,7 @@ use crate::carbonio::{CarbonioClient, FolderSyncOutcome, SyncOutcome};
 use crate::codepages::{
     activesync_folder_type, airsync_decode_table, airsync_encode_table, airsync_item_page_of,
     airsyncbase_decode_table, airsyncbase_encode_table, calendar_encode_table, composemail_decode_table,
-    contacts_encode_table, email_encode_table, folderhierarchy_decode_table,
+    contacts_encode_table, email_decode_table, email_encode_table, folderhierarchy_decode_table,
     folderhierarchy_encode_table, itemestimate_decode_table,
     itemestimate_encode_table, itemoperations_decode_table, itemoperations_encode_table,
     merge_decode_tables, merge_encode_tables, move_decode_table, move_encode_table, ping_decode_table,
@@ -351,11 +351,16 @@ async fn handle_sync(
     request: &ActiveSyncRequest,
     body: &[u8],
 ) -> Response {
-    // Merged with AirSyncBase: a real Sync request's Options/BodyPreference
-    // block switches to that codepage (confirmed live against a real
-    // Android Mail client), which airsync_decode_table() alone can't
-    // recognize.
-    let decode_table = merge_decode_tables(vec![crate::codepages::airsync_decode_table(), airsyncbase_decode_table()]);
+    // Merged with AirSyncBase (a real Sync request's Options/BodyPreference
+    // block switches to that codepage) and Email (a real device's `Change`
+    // command -- sent whenever the user reads/unreads a message on the
+    // phone -- switches to the Email codepage for its `Read` flag). Both
+    // confirmed live against a real Android Gmail client: without Email
+    // merged in here, every such push 400'd outright (`unknown tag token
+    // 0x15 on codepage 2`), which left the device stuck retrying the same
+    // failed push instead of moving on to pull new mail.
+    let decode_table =
+        merge_decode_tables(vec![crate::codepages::airsync_decode_table(), airsyncbase_decode_table(), email_decode_table()]);
     let nodes = match WbxmlDecoder::new(body, &decode_table).decode() {
         Ok(n) => n,
         Err(e) => {
@@ -389,6 +394,28 @@ async fn handle_sync(
                 .into_response()
         }
     };
+
+    // Apply any read/unread pushes from the device (its `Commands/Change`
+    // entries) before anything else, regardless of which SyncKey branch
+    // this request falls into: a real device sends these the moment the
+    // user reads/unreads a message on the phone, not tied to a particular
+    // delta cycle. Only meaningful for email; contacts/calendar don't have
+    // a `Read` flag.
+    if matches!(kind, CollectionKind::Email) {
+        let mut changes = Vec::new();
+        find_all_tag_occurrences(&nodes, "Change", &mut changes);
+        for change in changes {
+            let Some(server_id) = find_text_child(change, "ServerId") else { continue };
+            let mut app_data_blocks = Vec::new();
+            find_all_tag_occurrences(change, "ApplicationData", &mut app_data_blocks);
+            let Some(app_data) = app_data_blocks.into_iter().next() else { continue };
+            if let Some(read_flag) = find_text_child(app_data, "Read") {
+                if let Err(e) = client.set_message_read(&server_id, read_flag == "1").await {
+                    eprintln!("[activesync] Sync Change (mark read) for {server_id} failed: {e:?}");
+                }
+            }
+        }
+    }
 
     let current_key = sync_state.current_key(&request.user, &request.device_id, &collection_id);
 
@@ -1845,5 +1872,42 @@ mod tests {
         let raw = b"To: a@b.com\r\nSubject: hi\r\n\r\nplain body".to_vec();
         let rfc822_bytes = extract_sendmail_rfc822(&raw);
         assert_eq!(rfc822_bytes, raw);
+    }
+
+    /// Exact bytes captured from a real Android Gmail `Sync` push: the
+    /// device marking message ServerId "487" read after the user opened it
+    /// on the phone (`<Sync><Collections><Collection><SyncKey>487</SyncKey>
+    /// <CollectionId>2</CollectionId><GetChanges>0</GetChanges><Commands>
+    /// <Change><ServerId>284</ServerId><ApplicationData><Email:Read>1
+    /// </Email:Read></ApplicationData></Change></Commands></Collection>
+    /// </Collections></Sync>`). Used to 400 outright (`unknown tag token
+    /// 0x15 on codepage 2`) because handle_sync's decode table never
+    /// included the Email codepage.
+    const REAL_GMAIL_MARK_READ_WBXML: &[u8] = &[
+        0x03, 0x01, 0x6a, 0x00, 0x45, 0x5c, 0x4f, 0x4b, 0x03, 0x34, 0x38, 0x37,
+        0x00, 0x01, 0x52, 0x03, 0x32, 0x00, 0x01, 0x53, 0x03, 0x30, 0x00, 0x01,
+        0x56, 0x48, 0x4d, 0x03, 0x32, 0x38, 0x34, 0x00, 0x01, 0x5d, 0x00, 0x02,
+        0x55, 0x03, 0x31, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    ];
+
+    #[test]
+    fn decodes_a_real_gmail_mark_as_read_sync_push() {
+        let decode_table =
+            merge_decode_tables(vec![crate::codepages::airsync_decode_table(), airsyncbase_decode_table(), email_decode_table()]);
+        let nodes = WbxmlDecoder::new(REAL_GMAIL_MARK_READ_WBXML, &decode_table)
+            .decode()
+            .expect("a real device's mark-as-read Sync push must decode");
+
+        assert_eq!(find_text_child(&nodes, "SyncKey"), Some("487".to_string()));
+        assert_eq!(find_text_child(&nodes, "CollectionId"), Some("2".to_string()));
+
+        let mut changes = Vec::new();
+        find_all_tag_occurrences(&nodes, "Change", &mut changes);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(find_text_child(changes[0], "ServerId"), Some("284".to_string()));
+
+        let mut app_data_blocks = Vec::new();
+        find_all_tag_occurrences(changes[0], "ApplicationData", &mut app_data_blocks);
+        assert_eq!(find_text_child(app_data_blocks[0], "Read"), Some("1".to_string()));
     }
 }

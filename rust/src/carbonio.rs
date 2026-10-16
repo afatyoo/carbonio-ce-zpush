@@ -3,6 +3,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 
+/// Carbonio/Zimbra's own id for every account's root folder ("USER_ROOT"),
+/// fixed across accounts. Never sent to an ActiveSync device as a real
+/// folder; MS-ASCMD's own "no parent, top level" id is the synthetic "0"
+/// (2.2.3.167.1 ParentId), not this one.
+const CARBONIO_ROOT_FOLDER_ID: &str = "1";
+
 /// Minimal JSON-SOAP client for Zextras Carbonio CE's `urn:zimbraAccount` /
 /// `urn:zimbraMail` namespaces, reachable at `<base_url>/service/soap/`.
 pub struct CarbonioClient {
@@ -288,7 +294,19 @@ impl CarbonioClient {
             .context("GetFolderResponse had no root folder")?;
 
         let mut flat = Vec::new();
-        flatten_folder(&root, None, &mut flat);
+        // MS-ASCMD's FolderSync always uses ServerId "0" to mean "no parent,
+        // top level" (2.2.3.167.1 ParentId). Carbonio's own root folder has a
+        // real id ("1", name "USER_ROOT") that is never sent to the device as
+        // its own Add node, so passing that real id down as the top-level
+        // folders' ParentId -- what this used to do -- left every top-level
+        // folder's parent unresolved on the device, which silently hid them
+        // from the Gmail app's folder list (confirmed live: the whole folder
+        // list beyond Inbox/Sent never rendered). Top-level folders get the
+        // synthetic "0" as their parent instead; deeper folders still use
+        // their real Carbonio parent id.
+        for child in &root.folder {
+            flatten_folder(child, Some("0".to_string()), &mut flat);
+        }
         Ok(flat)
     }
 }
@@ -721,6 +739,55 @@ impl CarbonioClient {
                 .map(|d| d.error.code)
                 .unwrap_or_else(|| "UNKNOWN".to_string());
             bail!("Carbonio ItemActionRequest failed ({code}): {}", fault.reason.text);
+        }
+
+        Ok(())
+    }
+
+    /// Marks a message read/unread via `ItemActionRequest` (`op=read` or
+    /// `op=!read`, per Zimbra's SOAP docs), backing a real device's `Sync`
+    /// `Change`/`ApplicationData`/`Email:Read` push -- what the Gmail app
+    /// sends every time the user opens or marks read/unread a message on
+    /// the phone. Same request shape as [`Self::move_item`].
+    pub async fn set_message_read(&self, item_id: &str, read: bool) -> Result<()> {
+        let token = self.auth_token.as_deref().context("set_message_read called before authenticate")?;
+        let op = if read { "read" } else { "!read" };
+
+        let request_body = json!({
+            "Body": {
+                "ItemActionRequest": {
+                    "_jsns": "urn:zimbraMail",
+                    "action": { "op": op, "id": item_id }
+                }
+            },
+            "Header": {
+                "context": {
+                    "_jsns": "urn:zimbra",
+                    "authToken": { "_content": token }
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("ItemActionRequest (read) failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<ItemActionBody> = response
+            .json()
+            .await
+            .context("ItemActionRequest (read) response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault
+                .detail
+                .map(|d| d.error.code)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio ItemActionRequest (read) failed ({code}): {}", fault.reason.text);
         }
 
         Ok(())
@@ -1673,9 +1740,15 @@ struct RawSyncFolder {
 
 impl RawSyncFolder {
     fn into_carbonio_folder(self) -> Option<CarbonioFolder> {
+        let l = self.l?;
+        // Same "0" vs real Carbonio root id ("1") fix as get_folders' own
+        // flatten_folder call: a delta-changed top-level folder reports its
+        // parent as Carbonio's real root id, but MS-ASCMD needs the
+        // synthetic "0" there or the device can't resolve the parent.
+        let parent_id = if l == CARBONIO_ROOT_FOLDER_ID { "0".to_string() } else { l };
         Some(CarbonioFolder {
             id: self.id,
-            parent_id: Some(self.l?),
+            parent_id: Some(parent_id),
             name: self.name?,
             view: self.view,
             item_count: self.n,
@@ -2500,13 +2573,35 @@ mod tests {
             folders,
             vec![CarbonioFolder {
                 id: "312".into(),
-                parent_id: Some("1".into()),
+                // Carbonio's real root id ("1") must be remapped to the
+                // synthetic "0" MS-ASCMD expects for a top-level folder's
+                // parent -- a real device silently hides any folder whose
+                // ParentId it can't resolve, confirmed live.
+                parent_id: Some("0".into()),
                 name: "DeltaFolderTest".into(),
                 view: Some("message".into()),
                 item_count: 0,
                 mod_seq: 211,
             }]
         );
+    }
+
+    #[test]
+    fn sync_response_folder_with_a_non_root_parent_keeps_its_real_parent_id() {
+        let raw = r#"{
+            "Body": {
+                "SyncResponse": {
+                    "md": 1,
+                    "token": "212",
+                    "folder": [{"id": "313", "name": "SubOfInbox", "l": "2", "view": "message", "n": 0, "i4ms": 212}]
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        }"#;
+        let envelope: SoapEnvelope<SyncRequestBody> = serde_json::from_str(raw).unwrap();
+        let resp = envelope.body.sync_response.unwrap();
+        let folders: Vec<CarbonioFolder> = resp.folder.into_iter().filter_map(RawSyncFolder::into_carbonio_folder).collect();
+        assert_eq!(folders[0].parent_id, Some("2".into()));
     }
 
     #[test]
