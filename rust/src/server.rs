@@ -2,7 +2,7 @@ use crate::activesync_http::{ensure_supported_command, parse_activesync_query, p
 use crate::carbonio::{CarbonioClient, FolderSyncOutcome, SyncOutcome};
 use crate::codepages::{
     activesync_folder_type, airsync_decode_table, airsync_encode_table, airsync_item_page_of,
-    airsyncbase_decode_table, airsyncbase_encode_table, calendar_encode_table, composemail_decode_table,
+    airsyncbase_decode_table, airsyncbase_encode_table, calendar_decode_table, calendar_encode_table, composemail_decode_table,
     contacts_encode_table, email_decode_table, email_encode_table, folderhierarchy_decode_table,
     folderhierarchy_encode_table, itemestimate_decode_table,
     itemestimate_encode_table, itemoperations_decode_table, itemoperations_encode_table,
@@ -352,15 +352,22 @@ async fn handle_sync(
     body: &[u8],
 ) -> Response {
     // Merged with AirSyncBase (a real Sync request's Options/BodyPreference
-    // block switches to that codepage) and Email (a real device's `Change`
+    // block switches to that codepage), Email (a real device's `Change`
     // command -- sent whenever the user reads/unreads a message on the
-    // phone -- switches to the Email codepage for its `Read` flag). Both
-    // confirmed live against a real Android Gmail client: without Email
-    // merged in here, every such push 400'd outright (`unknown tag token
-    // 0x15 on codepage 2`), which left the device stuck retrying the same
-    // failed push instead of moving on to pull new mail.
-    let decode_table =
-        merge_decode_tables(vec![crate::codepages::airsync_decode_table(), airsyncbase_decode_table(), email_decode_table()]);
+    // phone -- switches to the Email codepage for its `Read` flag), and
+    // Calendar (a client-created event's `Commands/Add`/`ApplicationData`
+    // switches to the Calendar codepage for Subject/Location/StartTime/
+    // EndTime). The Email case is confirmed live against a real Android
+    // Gmail client: without it merged in here, every such push 400'd
+    // outright (`unknown tag token 0x15 on codepage 2`), which left the
+    // device stuck retrying the same failed push instead of moving on to
+    // pull new mail.
+    let decode_table = merge_decode_tables(vec![
+        crate::codepages::airsync_decode_table(),
+        airsyncbase_decode_table(),
+        email_decode_table(),
+        calendar_decode_table(),
+    ]);
     let nodes = match WbxmlDecoder::new(body, &decode_table).decode() {
         Ok(n) => n,
         Err(e) => {
@@ -417,6 +424,41 @@ async fn handle_sync(
         }
     }
 
+    // Apply any events the device created locally (its `Commands/Add`
+    // entries) -- a real device (confirmed live with Android's native
+    // Calendar app) sends these when the user creates an event on the
+    // phone, which used to be silently ignored outright: nothing in this
+    // function processed a client-sent `Add` for any collection kind, so
+    // the event just never made it to Carbonio at all. Per MS-ASCMD, the
+    // server must echo back the device's own `ClientId` together with the
+    // new item's real `ServerId` in a `Responses` block so the device can
+    // reconcile its locally-created placeholder with the real item.
+    let mut add_responses = Vec::new();
+    if matches!(kind, CollectionKind::Calendar) {
+        let mut adds = Vec::new();
+        find_all_tag_occurrences(&nodes, "Add", &mut adds);
+        for add in adds {
+            let Some(client_id) = find_text_child(add, "ClientId") else { continue };
+            let mut app_data_blocks = Vec::new();
+            find_all_tag_occurrences(add, "ApplicationData", &mut app_data_blocks);
+            let Some(app_data) = app_data_blocks.into_iter().next() else { continue };
+
+            let subject = find_text_child(app_data, "Subject").unwrap_or_default();
+            let location = find_text_child(app_data, "Location").unwrap_or_default();
+            let (Some(start), Some(end)) = (find_text_child(app_data, "StartTime"), find_text_child(app_data, "EndTime")) else {
+                continue;
+            };
+
+            match client.create_appointment(&collection_id, &subject, &location, &start, &end).await {
+                Ok(server_id) => add_responses.push((client_id, Ok(server_id))),
+                Err(e) => {
+                    eprintln!("[activesync] Sync Add (create appointment) for client_id={client_id} failed: {e:?}");
+                    add_responses.push((client_id, Err(())));
+                }
+            }
+        }
+    }
+
     let current_key = sync_state.current_key(&request.user, &request.device_id, &collection_id);
 
     if client_sync_key == "0" {
@@ -453,11 +495,11 @@ async fn handle_sync(
             },
             _ => sync_state.advance_key(&request.user, &request.device_id, &collection_id),
         };
-        return build_sync_response(&collection_id, "1", &new_key, adds, &kind);
+        return build_sync_response(&collection_id, "1", &new_key, adds, &kind, add_responses);
     }
 
     if client_sync_key != current_key {
-        return build_sync_response(&collection_id, "3", &current_key, Vec::new(), &kind);
+        return build_sync_response(&collection_id, "3", &current_key, Vec::new(), &kind, Vec::new());
     }
 
     // The device is already caught up on *our* counter, but that doesn't
@@ -470,10 +512,10 @@ async fn handle_sync(
     // `item:{...}`, one `GetContactsRequest`/`GetAppointmentRequest` per id
     // for contacts/calendar, since there's no bulk-by-id call for those).
     match client.sync_since(Some(&current_key), &collection_id).await {
-        Ok(SyncOutcome::MustResync) => build_sync_response(&collection_id, "3", &current_key, Vec::new(), &kind),
+        Ok(SyncOutcome::MustResync) => build_sync_response(&collection_id, "3", &current_key, Vec::new(), &kind, Vec::new()),
         Ok(SyncOutcome::Delta { token, changed_ids }) => {
             if changed_ids.is_empty() {
-                return build_sync_response(&collection_id, "1", &current_key, Vec::new(), &kind);
+                return build_sync_response(&collection_id, "1", &current_key, Vec::new(), &kind, add_responses);
             }
             let adds = match &kind {
                 CollectionKind::Email => {
@@ -520,7 +562,7 @@ async fn handle_sync(
                 Ok(t) => sync_state.set_key(&request.user, &request.device_id, &collection_id, t),
                 Err(_) => sync_state.advance_key(&request.user, &request.device_id, &collection_id),
             };
-            build_sync_response(&collection_id, "1", &new_key, adds, &kind)
+            build_sync_response(&collection_id, "1", &new_key, adds, &kind, add_responses)
         }
         Err(e) => (StatusCode::BAD_GATEWAY, format!("SyncRequest from Carbonio failed: {e}")).into_response(),
     }
@@ -711,6 +753,7 @@ fn build_sync_response(
     sync_key: &str,
     adds: Vec<WbxmlNode>,
     kind: &CollectionKind,
+    add_responses: Vec<(String, Result<String, ()>)>,
 ) -> Response {
     let (class_name, item_page, item_encode_table) = match kind {
         CollectionKind::Email => ("Email", PAGE_EMAIL, email_encode_table()),
@@ -738,6 +781,40 @@ fn build_sync_response(
     ];
     if !adds.is_empty() {
         collection_children.push(WbxmlNode::Tag { name: "Commands".into(), children: adds });
+    }
+    if !add_responses.is_empty() {
+        // Per MS-ASCMD 2.2.3.28, a client-created item's `Add` gets echoed
+        // back here with its own `ClientId` plus the real `ServerId` the
+        // server assigned (status 1), or just a non-1 status with no
+        // `ServerId` on failure, so the device can reconcile its local
+        // placeholder with the server's own id.
+        let response_adds = add_responses
+            .into_iter()
+            .map(|(client_id, result)| {
+                let mut children = vec![WbxmlNode::Tag {
+                    name: "ClientId".into(),
+                    children: vec![WbxmlNode::Text(client_id)],
+                }];
+                match result {
+                    Ok(server_id) => {
+                        children.push(WbxmlNode::Tag {
+                            name: "Status".into(),
+                            children: vec![WbxmlNode::Text("1".into())],
+                        });
+                        children.push(WbxmlNode::Tag {
+                            name: "ServerId".into(),
+                            children: vec![WbxmlNode::Text(server_id)],
+                        });
+                    }
+                    Err(()) => children.push(WbxmlNode::Tag {
+                        name: "Status".into(),
+                        children: vec![WbxmlNode::Text("5".into())],
+                    }),
+                }
+                WbxmlNode::Tag { name: "Add".into(), children }
+            })
+            .collect();
+        collection_children.push(WbxmlNode::Tag { name: "Responses".into(), children: response_adds });
     }
 
     let tree = vec![WbxmlNode::Tag {
@@ -1947,5 +2024,70 @@ mod tests {
         let mut app_data_blocks = Vec::new();
         find_all_tag_occurrences(changes[0], "ApplicationData", &mut app_data_blocks);
         assert_eq!(find_text_child(app_data_blocks[0], "Read"), Some("1".to_string()));
+    }
+
+    #[test]
+    fn decodes_a_client_created_calendar_event_push() {
+        // Shape matches MS-ASCMD's own `Sync` `Commands/Add` for a
+        // client-created item: `ClientId` (AirSync) plus `ApplicationData`
+        // switching to the Calendar codepage for the event's own fields.
+        // handle_sync's decode table used to have no Calendar codepage at
+        // all merged in, so this would have 400'd exactly like the
+        // mark-as-read push did before Email was merged in.
+        let tree = vec![WbxmlNode::Tag {
+            name: "Add".into(),
+            children: vec![
+                WbxmlNode::Tag {
+                    name: "ClientId".into(),
+                    children: vec![WbxmlNode::Text("1".into())],
+                },
+                WbxmlNode::Tag {
+                    name: "ApplicationData".into(),
+                    children: vec![
+                        WbxmlNode::Tag {
+                            name: "Subject".into(),
+                            children: vec![WbxmlNode::Text("Team sync".into())],
+                        },
+                        WbxmlNode::Tag {
+                            name: "Location".into(),
+                            children: vec![WbxmlNode::Text("Room 1".into())],
+                        },
+                        WbxmlNode::Tag {
+                            name: "StartTime".into(),
+                            children: vec![WbxmlNode::Text("20261020T160000Z".into())],
+                        },
+                        WbxmlNode::Tag {
+                            name: "EndTime".into(),
+                            children: vec![WbxmlNode::Text("20261020T170000Z".into())],
+                        },
+                    ],
+                },
+            ],
+        }];
+
+        let encode_table = merge_encode_tables(vec![airsync_encode_table(), calendar_encode_table()]);
+        let page_of = |name: &str| if matches!(name, "Add" | "ClientId" | "ApplicationData") { PAGE_AIRSYNC } else { PAGE_CALENDAR };
+        let encoded = WbxmlEncoder::new(&encode_table).encode(&tree, &page_of).expect("encode must succeed");
+
+        let decode_table = merge_decode_tables(vec![
+            crate::codepages::airsync_decode_table(),
+            airsyncbase_decode_table(),
+            email_decode_table(),
+            calendar_decode_table(),
+        ]);
+        let nodes = WbxmlDecoder::new(&encoded, &decode_table).decode().expect("a client-created event push must decode");
+
+        let mut adds = Vec::new();
+        find_all_tag_occurrences(&nodes, "Add", &mut adds);
+        assert_eq!(adds.len(), 1);
+        assert_eq!(find_text_child(adds[0], "ClientId"), Some("1".to_string()));
+
+        let mut app_data_blocks = Vec::new();
+        find_all_tag_occurrences(adds[0], "ApplicationData", &mut app_data_blocks);
+        let app_data = app_data_blocks[0];
+        assert_eq!(find_text_child(app_data, "Subject"), Some("Team sync".to_string()));
+        assert_eq!(find_text_child(app_data, "Location"), Some("Room 1".to_string()));
+        assert_eq!(find_text_child(app_data, "StartTime"), Some("20261020T160000Z".to_string()));
+        assert_eq!(find_text_child(app_data, "EndTime"), Some("20261020T170000Z".to_string()));
     }
 }

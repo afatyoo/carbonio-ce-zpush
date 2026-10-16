@@ -1251,6 +1251,82 @@ impl CarbonioClient {
             .context("GetAppointmentResponse's appt had no invite/component data")
     }
 
+    /// Creates a calendar event via `CreateAppointmentRequest`
+    /// (`urn:zimbraMail`), for a `Sync` `Commands/Add` on a calendar
+    /// collection -- a real device (confirmed live with Android's native
+    /// Email/Calendar app) sends this when the user creates an event on
+    /// the phone, and it used to just be silently ignored since nothing in
+    /// `handle_sync` processed a client-sent `Add` at all for any
+    /// collection kind. `s`/`e` need the `d` (date-string) field, not `u`
+    /// (epoch ms): confirmed live, `CreateAppointmentRequest` without `d`
+    /// hard-fails with `invalid request: missing required attribute: d`.
+    /// `start`/`end` are plain AS datetime strings (`format_activesync_datetime`'s
+    /// own shape, `YYYYMMDDTHHMMSSZ`), which is exactly the `d` format
+    /// Zimbra expects, so they're passed straight through unparsed.
+    /// Returns the new appointment's id, for the `Add` response's `ServerId`.
+    pub async fn create_appointment(&self, folder_id: &str, subject: &str, location: &str, start: &str, end: &str) -> Result<String> {
+        let token = self.auth_token.as_deref().context("create_appointment called before authenticate")?;
+
+        let request_body = json!({
+            "Body": {
+                "CreateAppointmentRequest": {
+                    "_jsns": "urn:zimbraMail",
+                    "m": {
+                        "l": folder_id,
+                        "su": subject,
+                        "inv": {
+                            "comp": {
+                                "name": subject,
+                                "loc": location,
+                                "allDay": "0",
+                                "s": { "d": start },
+                                "e": { "d": end },
+                                "status": "CONF",
+                                "fb": "B",
+                                "transp": "O"
+                            }
+                        },
+                        "mp": { "ct": "text/plain", "content": { "_content": "" } }
+                    }
+                }
+            },
+            "Header": {
+                "context": {
+                    "_jsns": "urn:zimbra",
+                    "authToken": { "_content": token }
+                }
+            },
+            "_jsns": "urn:zimbraSoap"
+        });
+
+        let response = self
+            .http
+            .post(self.soap_endpoint())
+            .json(&request_body)
+            .send()
+            .await
+            .context("CreateAppointmentRequest failed to reach Carbonio SOAP endpoint")?;
+
+        let envelope: SoapEnvelope<CreateAppointmentBody> = response
+            .json()
+            .await
+            .context("CreateAppointmentRequest response was not valid SOAP-JSON")?;
+
+        if let Some(fault) = envelope.body.fault {
+            let code = fault
+                .detail
+                .map(|d| d.error.code)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            bail!("Carbonio CreateAppointmentRequest failed ({code}): {}", fault.reason.text);
+        }
+
+        envelope
+            .body
+            .create_appointment_response
+            .map(|r| r.cal_item_id)
+            .context("CreateAppointmentResponse missing from a non-fault SOAP reply")
+    }
+
     /// Fetches a message's plain-text body and attachment list via
     /// `GetMsgRequest` (`urn:zimbraMail`). The body is the first MIME part
     /// (searched recursively, since a `multipart/alternative` nests its
@@ -1934,6 +2010,20 @@ struct GetAppointmentBody {
     get_appointment_response: Option<GetAppointmentResponse>,
     #[serde(rename = "Fault")]
     fault: Option<SoapFault>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateAppointmentBody {
+    #[serde(rename = "CreateAppointmentResponse")]
+    create_appointment_response: Option<CreateAppointmentResponse>,
+    #[serde(rename = "Fault")]
+    fault: Option<SoapFault>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateAppointmentResponse {
+    #[serde(rename = "calItemId")]
+    cal_item_id: String,
 }
 
 #[derive(Debug, Deserialize)]
