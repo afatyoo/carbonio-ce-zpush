@@ -7,6 +7,13 @@ const SWITCH_PAGE: u8 = 0x00;
 const END: u8 = 0x01;
 const STR_I: u8 = 0x03;
 const LITERAL: u8 = 0x04;
+/// Raw binary content, length-prefixed (`mb_uint32`) rather than
+/// NUL-terminated like `STR_I`. Real devices use this for `SendMail`'s
+/// `MIME` element: the whole RFC 822 message is embedded as opaque bytes
+/// inside a `ComposeMail`-codepage WBXML wrapper, not posted as the raw
+/// HTTP body directly like this project originally assumed -- confirmed
+/// live capturing a real device's actual `SendMail` request.
+const OPAQUE: u8 = 0xC3;
 
 /// Minimum WBXML version/header bytes z-push and real devices send:
 /// version 1.3 (0x03), unknown public id (0x01), UTF-8 charset (0x6A),
@@ -23,6 +30,9 @@ pub enum WbxmlNode {
         children: Vec<WbxmlNode>,
     },
     Text(String),
+    /// Raw binary content (WBXML's `OPAQUE` type), not necessarily valid
+    /// UTF-8 text -- used for `SendMail`'s embedded RFC 822 `MIME` blob.
+    Opaque(Vec<u8>),
 }
 
 /// Decodes a WBXML byte stream into a tree, resolving tag tokens against the
@@ -111,6 +121,15 @@ impl<'a> WbxmlDecoder<'a> {
                 nodes.push(WbxmlNode::Text(text));
                 continue;
             }
+            if byte == OPAQUE {
+                self.pos += 1;
+                let len = self.read_mb_uint32()? as usize;
+                let end = self.pos + len;
+                let slice = self.data.get(self.pos..end).ok_or_else(|| anyhow::anyhow!("OPAQUE length runs past end of WBXML stream"))?;
+                nodes.push(WbxmlNode::Opaque(slice.to_vec()));
+                self.pos = end;
+                continue;
+            }
             if byte == LITERAL {
                 bail!("LITERAL tag tokens are not supported by this decoder");
             }
@@ -162,6 +181,23 @@ impl<'a> WbxmlEncoder<'a> {
         self.out.push(0x00);
     }
 
+    fn write_mb_uint32(&mut self, mut value: u32) {
+        let mut bytes = vec![(value & 0x7F) as u8];
+        value >>= 7;
+        while value > 0 {
+            bytes.push(((value & 0x7F) as u8) | 0x80);
+            value >>= 7;
+        }
+        bytes.reverse();
+        self.out.extend_from_slice(&bytes);
+    }
+
+    fn write_opaque(&mut self, data: &[u8]) {
+        self.out.push(OPAQUE);
+        self.write_mb_uint32(data.len() as u32);
+        self.out.extend_from_slice(data);
+    }
+
     fn resolve_token(&self, page: u8, name: &str) -> Result<u8> {
         self.codepages
             .get(&page)
@@ -183,6 +219,7 @@ impl<'a> WbxmlEncoder<'a> {
         for node in nodes {
             match node {
                 WbxmlNode::Text(text) => self.write_str_i(text),
+                WbxmlNode::Opaque(data) => self.write_opaque(data),
                 WbxmlNode::Tag { name, children } => {
                     let page = page_of(name);
                     if page != self.current_page {
@@ -218,6 +255,24 @@ pub fn find_text_child(nodes: &[WbxmlNode], tag_name: &str) -> Option<String> {
                 }
             }
             if let Some(found) = find_text_child(children, tag_name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Same as `find_text_child`, but for a tag whose content is raw `OPAQUE`
+/// bytes (e.g. `SendMail`'s `MIME` element) rather than a `STR_I` string.
+pub fn find_opaque_child(nodes: &[WbxmlNode], tag_name: &str) -> Option<Vec<u8>> {
+    for node in nodes {
+        if let WbxmlNode::Tag { name, children } = node {
+            if name == tag_name {
+                if let Some(WbxmlNode::Opaque(data)) = children.first() {
+                    return Some(data.clone());
+                }
+            }
+            if let Some(found) = find_opaque_child(children, tag_name) {
                 return Some(found);
             }
         }
@@ -305,6 +360,48 @@ mod tests {
         let stream = vec![WBXML_VERSION, PUBLIC_ID_UNKNOWN, CHARSET_UTF8, 0x00, 0x3A];
         let err = WbxmlDecoder::new(&stream, &decode_table).decode().unwrap_err();
         assert!(err.to_string().contains("unknown tag token"));
+    }
+
+    #[test]
+    fn decodes_opaque_content_by_its_length_prefix() {
+        // header, tag with content (token 0x05), OPAQUE "hi" (0xC3, len 2,
+        // 'h','i'), end tag. Confirms OPAQUE's mb_uint32 length prefix is
+        // read correctly and doesn't get confused with a following byte
+        // that would otherwise look like more tag data.
+        let mut decode_table = HashMap::new();
+        let mut page0 = HashMap::new();
+        page0.insert(0x05, "MIME");
+        decode_table.insert(0, page0);
+
+        let stream = vec![WBXML_VERSION, PUBLIC_ID_UNKNOWN, CHARSET_UTF8, 0x00, 0x45, OPAQUE, 0x02, b'h', b'i', END];
+        let decoded = WbxmlDecoder::new(&stream, &decode_table).decode().unwrap();
+        assert_eq!(
+            decoded,
+            vec![WbxmlNode::Tag { name: "MIME".into(), children: vec![WbxmlNode::Opaque(b"hi".to_vec())] }]
+        );
+        assert_eq!(find_opaque_child(&decoded, "MIME"), Some(b"hi".to_vec()));
+    }
+
+    #[test]
+    fn opaque_round_trips_through_encode_and_decode_past_the_single_byte_length_boundary() {
+        // 200 bytes needs a 2-byte mb_uint32 length prefix (anything >127),
+        // exercising write_mb_uint32's multi-byte path, which a real
+        // device's MIME payload (hundreds of bytes) always needs.
+        let mut decode_table = HashMap::new();
+        let mut decode_page0 = HashMap::new();
+        decode_page0.insert(0x05, "MIME");
+        decode_table.insert(0, decode_page0);
+        let mut encode_table = HashMap::new();
+        let mut encode_page0 = HashMap::new();
+        encode_page0.insert("MIME", 0x05);
+        encode_table.insert(0, encode_page0);
+
+        let payload: Vec<u8> = (0..200).map(|i| (i % 256) as u8).collect();
+        let tree = vec![WbxmlNode::Tag { name: "MIME".into(), children: vec![WbxmlNode::Opaque(payload.clone())] }];
+
+        let encoded = WbxmlEncoder::new(&encode_table).encode(&tree, &|_name| 0u8).unwrap();
+        let decoded = WbxmlDecoder::new(&encoded, &decode_table).decode().unwrap();
+        assert_eq!(find_opaque_child(&decoded, "MIME"), Some(payload));
     }
 
     #[test]

@@ -1190,6 +1190,19 @@ impl CarbonioClient {
     /// parts one level deeper) marked `body: true` with a `text/plain`
     /// content type; HTML-only messages and messages with no plain-text
     /// part get an empty body string rather than an error.
+    ///
+    /// `markRead: "0"` is load-bearing, not cosmetic: Carbonio's
+    /// `GetMsgRequest` marks a message read by default, and this method is
+    /// also called from `Sync` just to check whether a message has
+    /// attachments (not because the device read anything). Confirmed live
+    /// that without this flag, that incidental read-marking bumps the
+    /// folder's own change counter, which made `FolderSync`'s delta sync
+    /// think the folder hierarchy kept changing, which reset every
+    /// collection's SyncKey back to "0" on every poll -- a real device
+    /// stuck in a permanent full-resync loop, never settling into a quiet
+    /// steady state. Read status should only change because a device
+    /// explicitly asks for it (which isn't implemented), never as a side
+    /// effect of this project's own internal lookups.
     pub async fn get_message_details(&self, message_id: &str) -> Result<MessageDetails> {
         let token = self
             .auth_token
@@ -1200,7 +1213,7 @@ impl CarbonioClient {
             "Body": {
                 "GetMsgRequest": {
                     "_jsns": "urn:zimbraMail",
-                    "m": { "id": message_id }
+                    "m": { "id": message_id, "markRead": "0" }
                 }
             },
             "Header": {

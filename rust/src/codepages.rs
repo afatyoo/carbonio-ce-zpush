@@ -17,6 +17,7 @@ pub const PAGE_PROVISION: u8 = 0x0E;
 pub const PAGE_ITEMOPERATIONS: u8 = 0x14;
 pub const PAGE_SETTINGS: u8 = 0x12;
 pub const PAGE_AIRSYNCBASE: u8 = 0x11;
+pub const PAGE_COMPOSEMAIL: u8 = 0x15;
 
 /// AirSync (codepage 0) tags, [MS-ASWBXML] 2.1.2.1. Only the subset this
 /// server currently emits/consumes for FolderSync and item Sync.
@@ -178,7 +179,19 @@ const ITEMOPERATIONS_TAGS: &[(u8, &str)] = &[
 /// (`EMAIL_TAGS`'s own `Attachment`/`Attachments`/`AttName`/.../`Body`),
 /// which a real device built against a current EAS client version won't
 /// look for. Minimal subset: no `BodyPart`/`Preview`/inline-body support.
+///
+/// `BodyPreference`/`Type`/`TruncationSize`/`AllOrNone` were missing here
+/// until a real device's actual `Sync` request surfaced a hard decode
+/// failure: every real ActiveSync client puts a `BodyPreference` block
+/// inside `Sync`'s `Options` to say what body format/truncation it wants,
+/// something none of this project's own hand-built WBXML test requests
+/// happened to include, so the gap stayed invisible until a real Android
+/// Mail client's request hit it (confirmed live via raw body logging).
 const AIRSYNCBASE_TAGS: &[(u8, &str)] = &[
+    (0x05, "BodyPreference"),
+    (0x06, "Type"),
+    (0x07, "TruncationSize"),
+    (0x08, "AllOrNone"),
     (0x0A, "Body"),
     (0x0B, "Data"),
     (0x0C, "EstimatedDataSize"),
@@ -189,6 +202,25 @@ const AIRSYNCBASE_TAGS: &[(u8, &str)] = &[
     (0x11, "FileReference"),
     (0x12, "Method"),
     (0x17, "ContentType"),
+];
+
+/// ComposeMail (codepage 21) tags, [MS-ASWBXML] 2.1.2.21 (since EAS 14.0),
+/// cross-checked against the original PHP z-push's `wbxmldefs.php`. This
+/// is how a real EAS 14.0+ device actually sends `SendMail`: the whole
+/// RFC 822 message is embedded as `OPAQUE` binary content inside `MIME`,
+/// wrapped in a WBXML envelope on this codepage -- not posted as raw RFC
+/// 822 text directly, which is what this project originally assumed and
+/// which only worked for its own hand-built test requests. Confirmed live
+/// capturing a real Android Gmail `SendMail` request. Minimal subset: no
+/// `SmartForward`/`SmartReply`/`ReplaceMime`/source-item fields, since
+/// this project only composes new messages, it doesn't forward or reply
+/// to an existing one via this path.
+const COMPOSEMAIL_TAGS: &[(u8, &str)] = &[
+    (0x05, "SendMail"),
+    (0x08, "SaveInSentItems"),
+    (0x10, "MIME"),
+    (0x11, "ClientId"),
+    (0x12, "Status"),
 ];
 
 /// Move (codepage 5) tags, [MS-ASWBXML] 2.1.2.5. NOTE: like
@@ -260,26 +292,51 @@ const SETTINGS_TAGS: &[(u8, &str)] = &[
     (0x16, "DeviceInformation"),
 ];
 
-/// ActiveSync folder type codes (MS-ASCMD 2.2.3.165.1) for the Carbonio/Zimbra
-/// folder "view" attribute values we map to a FolderSync `<Type>`.
+/// ActiveSync folder type codes (MS-ASCMD 2.2.3.165.1), cross-checked
+/// against the original PHP z-push's `zpushdefs.php`. There's a real
+/// distinction this project got wrong before: `2` means "the one true
+/// default Inbox", not "any mail folder" -- every default/special folder
+/// has its own code, and only a folder the user created themselves gets
+/// one of the generic "User*" codes.
 pub mod folder_type {
-    pub const USER_GENERIC: &str = "1";
-    pub const USER_MAILBOX: &str = "2";
-    pub const USER_CALENDAR: &str = "8";
-    pub const USER_CONTACTS: &str = "14";
-    pub const USER_TASKS: &str = "7";
+    pub const OTHER: &str = "1";
+    pub const INBOX: &str = "2";
+    pub const DRAFTS: &str = "3";
+    pub const WASTEBASKET: &str = "4";
+    pub const SENTMAIL: &str = "5";
+    pub const APPOINTMENT: &str = "8";
+    pub const CONTACT: &str = "9";
+    pub const USER_MAIL: &str = "12";
+    pub const USER_APPOINTMENT: &str = "13";
+    pub const USER_CONTACT: &str = "14";
 }
 
-/// Maps a Carbonio/Zimbra `<folder view="...">` attribute to an ActiveSync
-/// folder type. Folders without a recognized view (e.g. a plain subfolder)
-/// default to generic email so they still show up rather than being dropped.
-pub fn activesync_folder_type(view: Option<&str>) -> &'static str {
+/// Maps a Carbonio folder to an ActiveSync folder type. Carbonio/Zimbra
+/// assigns the standard mail/system folders the same fixed ids on every
+/// account (`2`=Inbox, `3`=Trash, `5`=Sent, `6`=Drafts, `7`=Contacts,
+/// `10`=Calendar -- confirmed against this project's own live folder
+/// listings), which this project didn't use before: every `view="message"`
+/// folder (Inbox, Sent, Drafts, Trash, Junk, Archive, custom folders, all
+/// of them) was reported as type `2` (Inbox). A real device doesn't expect
+/// more than one folder claiming to be the default Inbox, and a mature EAS
+/// client (confirmed live against the Gmail app) can get stuck in a
+/// permanent resync loop -- never settling into a steady Ping-based
+/// state -- when the folder list is this inconsistent with itself.
+pub fn activesync_folder_type(folder_id: &str, view: Option<&str>) -> &'static str {
+    match folder_id {
+        "2" => return folder_type::INBOX,
+        "3" => return folder_type::WASTEBASKET,
+        "5" => return folder_type::SENTMAIL,
+        "6" => return folder_type::DRAFTS,
+        "7" => return folder_type::CONTACT,
+        "10" => return folder_type::APPOINTMENT,
+        _ => {}
+    }
     match view {
-        Some("appointment") => folder_type::USER_CALENDAR,
-        Some("contact") => folder_type::USER_CONTACTS,
-        Some("task") => folder_type::USER_TASKS,
-        Some("message") | None => folder_type::USER_MAILBOX,
-        Some(_) => folder_type::USER_GENERIC,
+        Some("appointment") => folder_type::USER_APPOINTMENT,
+        Some("contact") => folder_type::USER_CONTACT,
+        Some("message") | None => folder_type::USER_MAIL,
+        Some(_) => folder_type::OTHER,
     }
 }
 
@@ -373,6 +430,12 @@ pub fn airsyncbase_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
 pub fn airsyncbase_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
     build_encode_table(PAGE_AIRSYNCBASE, AIRSYNCBASE_TAGS)
 }
+pub fn composemail_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
+    build_decode_table(PAGE_COMPOSEMAIL, COMPOSEMAIL_TAGS)
+}
+pub fn composemail_encode_table() -> HashMap<u8, HashMap<&'static str, u8>> {
+    build_encode_table(PAGE_COMPOSEMAIL, COMPOSEMAIL_TAGS)
+}
 pub fn ping_decode_table() -> HashMap<u8, HashMap<u8, &'static str>> {
     build_decode_table(PAGE_PING, PING_TAGS)
 }
@@ -434,17 +497,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maps_known_carbonio_views_to_activesync_types() {
-        assert_eq!(activesync_folder_type(Some("appointment")), folder_type::USER_CALENDAR);
-        assert_eq!(activesync_folder_type(Some("contact")), folder_type::USER_CONTACTS);
-        assert_eq!(activesync_folder_type(Some("task")), folder_type::USER_TASKS);
-        assert_eq!(activesync_folder_type(Some("message")), folder_type::USER_MAILBOX);
-        assert_eq!(activesync_folder_type(None), folder_type::USER_MAILBOX);
+    fn maps_user_created_folders_by_view() {
+        assert_eq!(activesync_folder_type("312", Some("appointment")), folder_type::USER_APPOINTMENT);
+        assert_eq!(activesync_folder_type("13", Some("contact")), folder_type::USER_CONTACT);
+        assert_eq!(activesync_folder_type("312", Some("message")), folder_type::USER_MAIL);
+        assert_eq!(activesync_folder_type("312", None), folder_type::USER_MAIL);
     }
 
     #[test]
     fn unknown_view_falls_back_to_generic() {
-        assert_eq!(activesync_folder_type(Some("document")), folder_type::USER_GENERIC);
+        assert_eq!(activesync_folder_type("312", Some("document")), folder_type::OTHER);
+    }
+
+    #[test]
+    fn maps_carbonios_fixed_system_folder_ids_to_their_own_distinct_types() {
+        // Carbonio/Zimbra assigns these ids to the same system folders on
+        // every account (confirmed live): only Inbox should ever be type 2.
+        assert_eq!(activesync_folder_type("2", Some("message")), folder_type::INBOX);
+        assert_eq!(activesync_folder_type("3", None), folder_type::WASTEBASKET);
+        assert_eq!(activesync_folder_type("5", Some("message")), folder_type::SENTMAIL);
+        assert_eq!(activesync_folder_type("6", Some("message")), folder_type::DRAFTS);
+        assert_eq!(activesync_folder_type("7", Some("contact")), folder_type::CONTACT);
+        assert_eq!(activesync_folder_type("10", Some("appointment")), folder_type::APPOINTMENT);
+        // Junk (id 4) and anything else aren't special-cased -- they fall
+        // back to the generic per-view mapping, same as a user's own
+        // folders.
+        assert_eq!(activesync_folder_type("4", Some("message")), folder_type::USER_MAIL);
     }
 
     #[test]
@@ -464,6 +542,7 @@ mod tests {
             (search_decode_table(), search_encode_table()),
             (settings_decode_table(), settings_encode_table()),
             (airsyncbase_decode_table(), airsyncbase_encode_table()),
+            (composemail_decode_table(), composemail_encode_table()),
         ] {
             for (page, tokens) in &decode {
                 let encode_page = &encode[page];

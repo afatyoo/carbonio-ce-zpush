@@ -2,8 +2,8 @@ use crate::activesync_http::{ensure_supported_command, parse_activesync_query, p
 use crate::carbonio::{CarbonioClient, FolderSyncOutcome, SyncOutcome};
 use crate::codepages::{
     activesync_folder_type, airsync_decode_table, airsync_encode_table, airsync_item_page_of,
-    airsyncbase_decode_table, airsyncbase_encode_table, calendar_encode_table, contacts_encode_table,
-    email_encode_table, folderhierarchy_decode_table,
+    airsyncbase_decode_table, airsyncbase_encode_table, calendar_encode_table, composemail_decode_table,
+    contacts_encode_table, email_encode_table, folderhierarchy_decode_table,
     folderhierarchy_encode_table, itemestimate_decode_table,
     itemestimate_encode_table, itemoperations_decode_table, itemoperations_encode_table,
     merge_decode_tables, merge_encode_tables, move_decode_table, move_encode_table, ping_decode_table,
@@ -15,7 +15,7 @@ use crate::codepages::{
 };
 use crate::mime_lite::parse_rfc822;
 use crate::sync_state::SyncStateStore;
-use crate::wbxml::{find_text_child, WbxmlDecoder, WbxmlEncoder, WbxmlNode};
+use crate::wbxml::{find_opaque_child, find_text_child, WbxmlDecoder, WbxmlEncoder, WbxmlNode};
 use axum::{
     body::Bytes,
     extract::OriginalUri,
@@ -53,8 +53,41 @@ pub struct AppState {
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
-        .route("/Microsoft-Server-ActiveSync", post(handle_activesync))
+        .route(
+            "/Microsoft-Server-ActiveSync",
+            post(handle_activesync).options(handle_activesync_options),
+        )
         .with_state(Arc::new(state))
+}
+
+/// Real ActiveSync clients (Outlook, iOS Mail, Android's built-in Exchange
+/// support) send an `OPTIONS` request to this endpoint before ever
+/// attempting a `POST`, to discover which protocol versions and commands
+/// the server supports (MS-ASHTTP 3.1.5.1). Without a real `200` reply
+/// carrying `MS-ASProtocolVersions`/`MS-ASProtocolCommands`, these clients
+/// refuse to proceed to Provision/FolderSync at all -- confirmed live: a
+/// real device's setup screen failed with no request ever reaching this
+/// server's logs, while hand-built WBXML sent straight to `POST` (which
+/// skips the `OPTIONS` probe real clients do first) worked the whole time,
+/// masking this gap completely until a real client was tried. Advertises
+/// protocol version 14.1 (the newest version every command this project
+/// implements was written against) and the command list
+/// `ensure_supported_command` actually accepts.
+async fn handle_activesync_options() -> Response {
+    (
+        StatusCode::OK,
+        [
+            ("Allow", "OPTIONS, POST"),
+            ("Public", "OPTIONS, POST"),
+            ("MS-Server-ActiveSync", "14.1"),
+            ("MS-ASProtocolVersions", "2.5,12.0,12.1,14.0,14.1"),
+            (
+                "MS-ASProtocolCommands",
+                "FolderSync,Sync,Provision,Ping,SendMail,GetItemEstimate,ItemOperations,MoveItems,ResolveRecipients,Settings,Search",
+            ),
+        ],
+    )
+        .into_response()
 }
 
 async fn handle_activesync(
@@ -227,7 +260,7 @@ fn folder_to_add_node(folder: &crate::carbonio::CarbonioFolder) -> WbxmlNode {
             },
             WbxmlNode::Tag {
                 name: "Type".into(),
-                children: vec![WbxmlNode::Text(activesync_folder_type(folder.view.as_deref()).into())],
+                children: vec![WbxmlNode::Text(activesync_folder_type(&folder.id, folder.view.as_deref()).into())],
             },
         ],
     }
@@ -318,16 +351,27 @@ async fn handle_sync(
     request: &ActiveSyncRequest,
     body: &[u8],
 ) -> Response {
-    let decode_table = crate::codepages::airsync_decode_table();
+    // Merged with AirSyncBase: a real Sync request's Options/BodyPreference
+    // block switches to that codepage (confirmed live against a real
+    // Android Mail client), which airsync_decode_table() alone can't
+    // recognize.
+    let decode_table = merge_decode_tables(vec![crate::codepages::airsync_decode_table(), airsyncbase_decode_table()]);
     let nodes = match WbxmlDecoder::new(body, &decode_table).decode() {
         Ok(n) => n,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("failed to decode Sync body: {e}")).into_response(),
+        Err(e) => {
+            eprintln!("[activesync] Sync decode failed: {e} -- raw body ({} bytes): {}", body.len(), hex_dump(body));
+            return (StatusCode::BAD_REQUEST, format!("failed to decode Sync body: {e}")).into_response();
+        }
     };
 
     let client_sync_key = find_text_child(&nodes, "SyncKey").unwrap_or_else(|| "0".to_string());
     let collection_id = match find_text_child(&nodes, "CollectionId") {
         Some(id) => id,
-        None => return (StatusCode::BAD_REQUEST, "Sync body missing CollectionId").into_response(),
+        None => {
+            eprintln!("[activesync] Sync missing CollectionId -- raw body ({} bytes): {}", body.len(), hex_dump(body));
+            eprintln!("[activesync] decoded nodes: {nodes:?}");
+            return (StatusCode::BAD_REQUEST, "Sync body missing CollectionId").into_response();
+        }
     };
 
     let folders = match client.get_folders().await {
@@ -1284,8 +1328,31 @@ async fn handle_fetch_appointment(client: &CarbonioClient, server_id: String) ->
 /// pull Subject/To/Cc/body and relay it through Carbonio's SendMsgRequest.
 /// HTML bodies and attachments (multipart MIME) are not parsed out
 /// separately yet; the raw body text is sent as-is as a text/plain part.
+/// A real EAS 14.0+ device wraps `SendMail`'s RFC 822 content in a WBXML
+/// envelope on the `ComposeMail` codepage, with the actual message
+/// embedded as `OPAQUE` binary content inside `MIME` -- confirmed live
+/// capturing a real Android Gmail `SendMail` request, which starts with a
+/// WBXML header (`03 01 6A 00...`) that's never valid RFC 822 text (real
+/// email headers start with printable ASCII like `To:`/`Date:`). This
+/// project's own hand-built test requests, and any client that still
+/// posts raw RFC 822 directly (the simpler, older convention this project
+/// originally assumed was universal), don't have that WBXML wrapper, so a
+/// failed decode here just means "treat the whole body as the message
+/// itself" rather than an error.
+fn extract_sendmail_rfc822(body: &[u8]) -> Vec<u8> {
+    let decode_table = composemail_decode_table();
+    match WbxmlDecoder::new(body, &decode_table).decode() {
+        Ok(nodes) => match find_opaque_child(&nodes, "MIME") {
+            Some(mime) => mime,
+            None => body.to_vec(),
+        },
+        Err(_) => body.to_vec(),
+    }
+}
+
 async fn handle_send_mail(client: &CarbonioClient, body: &[u8]) -> Response {
-    let parsed = parse_rfc822(body);
+    let rfc822_bytes = extract_sendmail_rfc822(body);
+    let parsed = parse_rfc822(&rfc822_bytes);
     if parsed.to.is_empty() {
         return (StatusCode::BAD_REQUEST, "SendMail body had no To recipients").into_response();
     }
@@ -1691,6 +1758,13 @@ async fn handle_search(client: &CarbonioClient, body: &[u8]) -> Response {
     (StatusCode::OK, [("Content-Type", "application/vnd.ms-sync.wbxml")], encoded).into_response()
 }
 
+/// Temporary debug helper for logging a raw WBXML body that failed to
+/// decode as expected, to compare against a real device's actual bytes
+/// instead of this project's own hand-built test WBXML.
+fn hex_dump(body: &[u8]) -> String {
+    body.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+}
+
 /// Placeholder until a real logging crate (tracing) is wired in; keeps the
 /// call site stable so swapping it out later touches one place.
 fn tracing_stub_log(request: &crate::activesync_http::ActiveSyncRequest, username: &str, body_len: usize) {
@@ -1698,4 +1772,78 @@ fn tracing_stub_log(request: &crate::activesync_http::ActiveSyncRequest, usernam
         "[activesync] cmd={} user={} device={}/{} auth_user={} body_bytes={}",
         request.command, request.user, request.device_id, request.device_type, username, body_len
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mime_lite::parse_rfc822;
+
+    /// Exact bytes captured from a real Android Gmail `SendMail` request
+    /// against this project's live server (see README "Known limitations" /
+    /// memory notes): a WBXML envelope on the ComposeMail codepage with the
+    /// RFC 822 message embedded as OPAQUE binary content inside `MIME`.
+    const REAL_GMAIL_SENDMAIL_WBXML: &[u8] = &[
+        0x03, 0x01, 0x6a, 0x00, 0x00, 0x15, 0x45, 0x51, 0x03, 0x53, 0x65, 0x6e,
+        0x64, 0x4d, 0x61, 0x69, 0x6c, 0x2d, 0x35, 0x35, 0x32, 0x30, 0x39, 0x37,
+        0x33, 0x33, 0x36, 0x39, 0x32, 0x32, 0x37, 0x32, 0x31, 0x00, 0x01, 0x08,
+        0x50, 0xc3, 0x83, 0x4b, 0x44, 0x61, 0x74, 0x65, 0x3a, 0x20, 0x46, 0x72,
+        0x69, 0x2c, 0x20, 0x31, 0x36, 0x20, 0x4f, 0x63, 0x74, 0x20, 0x32, 0x30,
+        0x32, 0x36, 0x20, 0x31, 0x39, 0x3a, 0x30, 0x37, 0x3a, 0x35, 0x33, 0x20,
+        0x2b, 0x30, 0x37, 0x30, 0x30, 0x0d, 0x0a, 0x53, 0x75, 0x62, 0x6a, 0x65,
+        0x63, 0x74, 0x3a, 0x20, 0x68, 0x61, 0x6c, 0x6c, 0x6f, 0x68, 0x0d, 0x0a,
+        0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x2d, 0x49, 0x44, 0x3a, 0x20,
+        0x3c, 0x62, 0x39, 0x38, 0x30, 0x62, 0x32, 0x38, 0x32, 0x2d, 0x61, 0x65,
+        0x37, 0x61, 0x2d, 0x34, 0x61, 0x33, 0x64, 0x2d, 0x61, 0x36, 0x31, 0x65,
+        0x2d, 0x35, 0x64, 0x35, 0x35, 0x33, 0x33, 0x36, 0x64, 0x38, 0x37, 0x32,
+        0x39, 0x40, 0x65, 0x6d, 0x61, 0x69, 0x6c, 0x2e, 0x61, 0x6e, 0x64, 0x72,
+        0x6f, 0x69, 0x64, 0x2e, 0x63, 0x6f, 0x6d, 0x3e, 0x0d, 0x0a, 0x58, 0x2d,
+        0x41, 0x6e, 0x64, 0x72, 0x6f, 0x69, 0x64, 0x2d, 0x4d, 0x65, 0x73, 0x73,
+        0x61, 0x67, 0x65, 0x2d, 0x49, 0x44, 0x3a, 0x20, 0x3c, 0x62, 0x39, 0x38,
+        0x30, 0x62, 0x32, 0x38, 0x32, 0x2d, 0x61, 0x65, 0x37, 0x61, 0x2d, 0x34,
+        0x61, 0x33, 0x64, 0x2d, 0x61, 0x36, 0x31, 0x65, 0x2d, 0x35, 0x64, 0x35,
+        0x35, 0x33, 0x33, 0x36, 0x64, 0x38, 0x37, 0x32, 0x39, 0x40, 0x65, 0x6d,
+        0x61, 0x69, 0x6c, 0x2e, 0x61, 0x6e, 0x64, 0x72, 0x6f, 0x69, 0x64, 0x2e,
+        0x63, 0x6f, 0x6d, 0x3e, 0x0d, 0x0a, 0x46, 0x72, 0x6f, 0x6d, 0x3a, 0x20,
+        0x7a, 0x70, 0x75, 0x73, 0x68, 0x2d, 0x74, 0x65, 0x73, 0x74, 0x40, 0x61,
+        0x66, 0x61, 0x74, 0x79, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x0d, 0x0a, 0x54,
+        0x6f, 0x3a, 0x20, 0x7a, 0x65, 0x78, 0x74, 0x72, 0x61, 0x73, 0x40, 0x61,
+        0x66, 0x61, 0x74, 0x79, 0x6f, 0x2e, 0x63, 0x6f, 0x6d, 0x0d, 0x0a, 0x49,
+        0x6d, 0x70, 0x6f, 0x72, 0x74, 0x61, 0x6e, 0x63, 0x65, 0x3a, 0x20, 0x4e,
+        0x6f, 0x72, 0x6d, 0x61, 0x6c, 0x0d, 0x0a, 0x58, 0x2d, 0x50, 0x72, 0x69,
+        0x6f, 0x72, 0x69, 0x74, 0x79, 0x3a, 0x20, 0x33, 0x0d, 0x0a, 0x58, 0x2d,
+        0x4d, 0x53, 0x4d, 0x61, 0x69, 0x6c, 0x2d, 0x50, 0x72, 0x69, 0x6f, 0x72,
+        0x69, 0x74, 0x79, 0x3a, 0x20, 0x4e, 0x6f, 0x72, 0x6d, 0x61, 0x6c, 0x0d,
+        0x0a, 0x4d, 0x49, 0x4d, 0x45, 0x2d, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f,
+        0x6e, 0x3a, 0x20, 0x31, 0x2e, 0x30, 0x0d, 0x0a, 0x43, 0x6f, 0x6e, 0x74,
+        0x65, 0x6e, 0x74, 0x2d, 0x54, 0x79, 0x70, 0x65, 0x3a, 0x20, 0x74, 0x65,
+        0x78, 0x74, 0x2f, 0x68, 0x74, 0x6d, 0x6c, 0x3b, 0x20, 0x63, 0x68, 0x61,
+        0x72, 0x73, 0x65, 0x74, 0x3d, 0x75, 0x74, 0x66, 0x2d, 0x38, 0x0d, 0x0a,
+        0x43, 0x6f, 0x6e, 0x74, 0x65, 0x6e, 0x74, 0x2d, 0x54, 0x72, 0x61, 0x6e,
+        0x73, 0x66, 0x65, 0x72, 0x2d, 0x45, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e,
+        0x67, 0x3a, 0x20, 0x62, 0x61, 0x73, 0x65, 0x36, 0x34, 0x0d, 0x0a, 0x0d,
+        0x0a, 0x50, 0x47, 0x52, 0x70, 0x64, 0x69, 0x42, 0x6b, 0x61, 0x58, 0x49,
+        0x39, 0x4a, 0x32, 0x46, 0x31, 0x64, 0x47, 0x38, 0x6e, 0x50, 0x6d, 0x68,
+        0x68, 0x62, 0x47, 0x78, 0x76, 0x62, 0x32, 0x39, 0x76, 0x50, 0x43, 0x39,
+        0x6b, 0x61, 0x58, 0x59, 0x2b, 0x0d, 0x0a, 0x01, 0x01,
+    ];
+
+    #[test]
+    fn unwraps_real_gmail_sendmail_wbxml_envelope_and_recovers_the_body() {
+        let rfc822_bytes = extract_sendmail_rfc822(REAL_GMAIL_SENDMAIL_WBXML);
+        let parsed = parse_rfc822(&rfc822_bytes);
+        assert_eq!(parsed.subject, "halloh");
+        assert_eq!(parsed.to, vec!["zextras@afatyo.com".to_string()]);
+        assert_eq!(
+            parsed.html_body.as_deref(),
+            Some("<div dir='auto'>halloooo</div>")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_treating_the_whole_body_as_raw_rfc822_when_not_wbxml() {
+        let raw = b"To: a@b.com\r\nSubject: hi\r\n\r\nplain body".to_vec();
+        let rfc822_bytes = extract_sendmail_rfc822(&raw);
+        assert_eq!(rfc822_bytes, raw);
+    }
 }
