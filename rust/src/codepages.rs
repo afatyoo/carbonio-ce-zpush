@@ -58,14 +58,34 @@ const CONTACTS_TAGS: &[(u8, &str)] = &[
     (0x2B, "MobilePhoneNumber"),
 ];
 
-/// Calendar (codepage 4) tags, [MS-ASWBXML] 2.1.2.4. Minimal field set: no
-/// attendees, recurrence, or reminders.
+/// Calendar (codepage 4) tags, [MS-ASWBXML] 2.1.2.4. `AllDayEvent`/
+/// `EndTime`/`Location`/`Subject`/`StartTime` were the only ones this
+/// project ever needed to *read* (for the server->device direction), so
+/// that's all it originally defined. A real device's own client-created
+/// event (confirmed live with Android's Calendar app, a `Sync`
+/// `Commands/Add`) carries several more fields in the same
+/// `ApplicationData` block this project now also needs to *decode*
+/// end-to-end, even for fields it doesn't act on -- a single unknown
+/// token anywhere aborts the whole message's decode. The extra tokens
+/// below are named from their position in the real captured bytes and
+/// content shape (a timezone blob, ISO timestamps, an organizer email
+/// matching the sender, a busy-status enum value, etc.), not otherwise
+/// used by this project.
 const CALENDAR_TAGS: &[(u8, &str)] = &[
+    (0x05, "Timezone"),
     (0x06, "AllDayEvent"),
+    (0x0D, "BusyStatus"),
+    (0x11, "DtStamp"),
     (0x12, "EndTime"),
     (0x17, "Location"),
+    (0x18, "MeetingStatus"),
+    (0x19, "OrganizerEmail"),
+    (0x1A, "OrganizerName"),
+    (0x24, "Reminder"),
+    (0x25, "Sensitivity"),
     (0x26, "Subject"),
     (0x27, "StartTime"),
+    (0x28, "UID"),
 ];
 
 /// Email (codepage 2) tags, [MS-ASWBXML] 2.1.2.3. Minimal field set for a
