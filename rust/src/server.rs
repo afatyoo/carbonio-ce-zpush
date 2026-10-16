@@ -555,45 +555,73 @@ async fn email_to_add_node(client: &CarbonioClient, m: &crate::carbonio::Carboni
         },
     ];
 
-    if m.has_attachment {
-        if let Ok(details) = client.get_message_details(&m.id).await {
-            if !details.attachments.is_empty() {
-                let attachment_nodes = details
-                    .attachments
-                    .iter()
-                    .map(|a| WbxmlNode::Tag {
-                        name: "Attachment".into(),
-                        children: vec![
-                            WbxmlNode::Tag {
-                                name: "DisplayName".into(),
-                                children: vec![WbxmlNode::Text(a.filename.clone())],
-                            },
-                            WbxmlNode::Tag {
-                                name: "FileReference".into(),
-                                children: vec![WbxmlNode::Text(format!("{}:{}", m.id, a.part_id))],
-                            },
-                            WbxmlNode::Tag {
-                                name: "Method".into(),
-                                children: vec![WbxmlNode::Text("1".into())],
-                            },
-                            WbxmlNode::Tag {
-                                name: "EstimatedDataSize".into(),
-                                children: vec![WbxmlNode::Text(a.size.to_string())],
-                            },
-                            WbxmlNode::Tag {
-                                name: "ContentType".into(),
-                                children: vec![WbxmlNode::Text(a.content_type.clone())],
-                            },
-                        ],
-                    })
-                    .collect();
-                application_data.push(WbxmlNode::Tag { name: "Attachments".into(), children: attachment_nodes });
-            }
+    // A real device (confirmed live with Android Gmail) never issues a
+    // separate `ItemOperations`/`Fetch` to read a message it already has
+    // from `Sync` -- it expects the body inline in the `Add` node's own
+    // AirSyncBase `Body` block. This used to only fetch message details
+    // (and therefore only ever send a body) for messages flagged as having
+    // an attachment, so every message without one synced with no body at
+    // all, confirmed live: the phone showed every email completely empty.
+    // Now fetched unconditionally so `Body` is always present.
+    if let Ok(details) = client.get_message_details(&m.id).await {
+        application_data.push(WbxmlNode::Tag {
+            name: "Body".into(),
+            children: vec![
+                WbxmlNode::Tag {
+                    name: "Type".into(),
+                    children: vec![WbxmlNode::Text("1".into())],
+                },
+                WbxmlNode::Tag {
+                    name: "EstimatedDataSize".into(),
+                    children: vec![WbxmlNode::Text(details.body.len().to_string())],
+                },
+                WbxmlNode::Tag {
+                    name: "Truncated".into(),
+                    children: vec![WbxmlNode::Text("0".into())],
+                },
+                WbxmlNode::Tag {
+                    name: "Data".into(),
+                    children: vec![WbxmlNode::Text(details.body.clone())],
+                },
+            ],
+        });
+
+        if !details.attachments.is_empty() {
+            let attachment_nodes = details
+                .attachments
+                .iter()
+                .map(|a| WbxmlNode::Tag {
+                    name: "Attachment".into(),
+                    children: vec![
+                        WbxmlNode::Tag {
+                            name: "DisplayName".into(),
+                            children: vec![WbxmlNode::Text(a.filename.clone())],
+                        },
+                        WbxmlNode::Tag {
+                            name: "FileReference".into(),
+                            children: vec![WbxmlNode::Text(format!("{}:{}", m.id, a.part_id))],
+                        },
+                        WbxmlNode::Tag {
+                            name: "Method".into(),
+                            children: vec![WbxmlNode::Text("1".into())],
+                        },
+                        WbxmlNode::Tag {
+                            name: "EstimatedDataSize".into(),
+                            children: vec![WbxmlNode::Text(a.size.to_string())],
+                        },
+                        WbxmlNode::Tag {
+                            name: "ContentType".into(),
+                            children: vec![WbxmlNode::Text(a.content_type.clone())],
+                        },
+                    ],
+                })
+                .collect();
+            application_data.push(WbxmlNode::Tag { name: "Attachments".into(), children: attachment_nodes });
         }
-        // A failed detail lookup here just means the device won't see an
-        // attachment list for this one message; the message itself still
-        // syncs normally rather than failing the whole Sync response.
     }
+    // A failed detail lookup here just means the device won't see a body
+    // or attachment list for this one message; the message itself still
+    // syncs normally rather than failing the whole Sync response.
 
     WbxmlNode::Tag {
         name: "Add".into(),
@@ -735,7 +763,17 @@ fn build_sync_response(
         if matches!(kind, CollectionKind::Email)
             && matches!(
                 name,
-                "Attachments" | "Attachment" | "DisplayName" | "FileReference" | "Method" | "EstimatedDataSize" | "ContentType"
+                "Attachments"
+                    | "Attachment"
+                    | "DisplayName"
+                    | "FileReference"
+                    | "Method"
+                    | "EstimatedDataSize"
+                    | "ContentType"
+                    | "Body"
+                    | "Type"
+                    | "Data"
+                    | "Truncated"
             )
         {
             PAGE_AIRSYNCBASE
