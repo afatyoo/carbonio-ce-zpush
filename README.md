@@ -30,10 +30,21 @@ Commands implemented: `FolderSync`, `Sync` (email, contacts, calendar, with real
 ### Requirements
 
 - A running Carbonio CE instance you have SOAP/HTTPS access to.
-- [Rust](https://www.rust-lang.org/tools/install) (stable toolchain) to build from source. There are no prebuilt binaries yet, so you build this directly on (or for) the machine that will run it.
 - The machine running this server needs network access to Carbonio's SOAP endpoint, and ActiveSync clients need HTTPS access to this server (see [Exposing it to real devices](#exposing-it-to-real-devices) below if you don't already have TLS in front of it).
 
-### 1. Clone and build
+### 1. Get the binary
+
+Download a prebuilt binary from the [releases page](https://github.com/afatyoo/carbonio-ce-zpush/releases):
+
+```bash
+curl -LO https://github.com/afatyoo/carbonio-ce-zpush/releases/download/v1.0.0/carbonio-ce-zpush-x86_64-linux.gz
+gunzip carbonio-ce-zpush-x86_64-linux.gz
+chmod +x carbonio-ce-zpush-x86_64-linux
+```
+
+(swap `x86_64-linux` for `aarch64-macos` if you're running this on an Apple Silicon Mac instead of the Linux server)
+
+Or build it yourself with [Rust](https://www.rust-lang.org/tools/install) (stable toolchain):
 
 ```bash
 git clone https://github.com/afatyoo/carbonio-ce-zpush.git
