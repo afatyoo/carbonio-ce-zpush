@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for considering a contribution. This project is a Rust rewrite of z-push targeting Carbonio CE specifically, not a generic ActiveSync server framework; keep that scope in mind when proposing changes.
+Thanks for considering a contribution. This project is a Rust rewrite of z-push targeting Carbonio CE specifically, not a generic ActiveSync server framework. Keep that scope in mind when proposing changes.
 
 ## Before you start
 
@@ -15,13 +15,13 @@ Open a GitHub issue with:
 - The ActiveSync command involved (`Sync`, `SendMail`, etc.), if known.
 - The client that triggered it (device/app and, if you have it, its user agent string).
 - Server logs around the time it happened, if you have access to them.
-- Raw request bytes, if you're able to capture them — several real bugs in this project were only found this way (see [CHANGELOG.md](CHANGELOG.md)'s "Fixed" sections for examples), and a hex dump of the actual WBXML body is the fastest way to pin one down.
+- Raw request bytes, if you're able to capture them. Several real bugs in this project were only found this way (see [CHANGELOG.md](CHANGELOG.md)'s "Fixed" sections for examples), and a hex dump of the actual WBXML body is the fastest way to pin one down.
 
 ## Making a change
 
 1. Fork the repo and create a branch from `main`.
 2. Make your change in `rust/src/`.
-3. Add a test. If you're fixing a decode or protocol bug, prefer a regression test using real captured bytes over a hand-built one — this project's own hand-built WBXML test requests have repeatedly missed gaps that only a real device's actual request shape exposed. See the existing tests in `server.rs`/`carbonio.rs` named `decodes_a_real_*` for the pattern.
+3. Add a test. If you're fixing a decode or protocol bug, prefer a regression test using real captured bytes over a hand-built one. This project's own hand-built WBXML test requests have repeatedly missed gaps that only a real device's actual request shape exposed. See the existing tests in `server.rs`/`carbonio.rs` named `decodes_a_real_*` for the pattern.
 4. Run the full test suite:
 
    ```bash

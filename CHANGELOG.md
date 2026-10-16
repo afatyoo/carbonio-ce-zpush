@@ -37,10 +37,10 @@ through a public HTTPS reverse proxy, not just hand-built WBXML on localhost.
   attachments (uploaded via Carbonio's REST `/service/upload`).
 - `Sync` `Commands/Add` and `Commands/Change` handling: a calendar event
   created on the device is created in Carbonio via `CreateAppointmentRequest`
-  and echoed back with its real `ServerId`; a message marked read/unread on
+  and echoed back with its real `ServerId`. A message marked read/unread on
   the device is applied via `ItemActionRequest`.
 - `Provision`: accepts any device so clients that refuse to sync without it
-  can get past the handshake (no EAS policy enforcement -- no PIN,
+  can get past the handshake (no EAS policy enforcement, no PIN,
   encryption, or remote wipe).
 - `Ping`: genuinely blocks on Carbonio's `WaitSetRequest` long-poll, and its
   `Status 2` response reports exactly which watched folder changed (using
@@ -90,7 +90,7 @@ proxy), not reproducible with this project's own hand-built WBXML:
   attachment.
 - **Inconsistent missing email bodies.** Carbonio flags whichever MIME part
   comes first in a `multipart/alternative` as the message "body" regardless
-  of whether it has real content; an HTML-only `SendMail` (this project's
+  of whether it has real content. An HTML-only `SendMail` (this project's
   own plain-first `multipart/alternative` construction) ended up with its
   empty plain-text part flagged instead of the real HTML content next to it.
 - **HTML-only message bodies still coming back empty**, because Carbonio's
@@ -99,11 +99,11 @@ proxy), not reproducible with this project's own hand-built WBXML:
 - **Client-created calendar events never reaching Carbonio at all.**
   `handle_sync` processed the device's `Change` entries but never its `Add`
   entries, for any collection kind, while still answering `Status 1` with no
-  `Responses` block -- so the device believed the create succeeded and never
+  `Responses` block, so the device believed the create succeeded and never
   retried it.
 - **A real client-created calendar event still failing to decode.** The
   Calendar codepage only ever defined the five fields this project needed to
-  read in the other direction; a real device's own event carries several
+  read in the other direction. A real device's own event carries several
   more (`Timezone`, `DtStamp`, `OrganizerEmail`, `BusyStatus`, `Reminder`,
   `Sensitivity`, `UID`).
 
@@ -124,7 +124,7 @@ proxy), not reproducible with this project's own hand-built WBXML:
 - **Calendar sync only carries a recurring event's first occurrence**, with
   no recurrence rule, attendees, or reminders.
 - **No client-created contacts.** `Sync` `Commands/Add` is only handled for
-  calendar events; a contact created on the device isn't pushed to Carbonio yet.
+  calendar events. A contact created on the device isn't pushed to Carbonio yet.
 
 See the [README](README.md#architecture) for the module layout and
 [real-device testing setup](README.md#real-device-testing-setup) this was

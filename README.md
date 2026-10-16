@@ -6,7 +6,7 @@
 
 An ActiveSync (Exchange protocol) connector for **Zextras Carbonio CE**, written in Rust. It lets ActiveSync clients (Android Mail/Gmail, iOS Mail, classic Outlook, and anything else that speaks EAS) sync email, contacts, and calendar against Carbonio CE without any PHP runtime on the mail server.
 
-Rewritten from scratch, inspired by [imanudin11/zimbra-zpush](https://github.com/imanudin11/zimbra-zpush) (the original PHP z-push with a Zimbra backend). None of the original PHP code lives in this repo; everything here is the Rust implementation in [`rust/`](rust/).
+Rewritten from scratch, inspired by [imanudin11/zimbra-zpush](https://github.com/imanudin11/zimbra-zpush) (the original PHP z-push with a Zimbra backend). None of the original PHP code lives in this repo. Everything here is the Rust implementation in [`rust/`](rust/).
 
 ## Why this exists
 
@@ -41,7 +41,7 @@ cd carbonio-ce-zpush/rust
 cargo build --release
 ```
 
-The binary lands at `target/release/carbonio-ce-zpush`. Run `cargo test` first if you want to confirm the build is healthy on your machine; it needs no network access or live Carbonio instance.
+The binary lands at `target/release/carbonio-ce-zpush`. Run `cargo test` first if you want to confirm the build is healthy on your machine. It needs no network access or live Carbonio instance.
 
 ### 2. Get Carbonio's TLS certificate
 
@@ -61,13 +61,13 @@ mkdir -p certs
 scp root@<your-carbonio-host>:/opt/zextras/ssl/carbonio/ca/ca.pem certs/ca.pem
 ```
 
-Certificates are not committed to this repo (`rust/certs/*.pem` is gitignored, since it identifies your server) — fetch them from your own Carbonio host as shown above.
+Certificates are not committed to this repo (`rust/certs/*.pem` is gitignored, since it identifies your server). Fetch them from your own Carbonio host as shown above.
 
 ### 3. Configure and run
 
 ```bash
 export CARBONIO_URL="https://<your-carbonio-host>"
-export LISTEN_ADDR="0.0.0.0:7272"                    # default shown; change the port if needed
+export LISTEN_ADDR="0.0.0.0:7272"                    # default shown, change the port if needed
 
 # TLS trust: match whichever certificate you fetched in step 2
 export CARBONIO_PINNED_CERT="certs/server.pem"       # pinning mode
@@ -123,7 +123,7 @@ systemctl status carbonio-ce-zpush
 
 ### 5. Point a device at it
 
-ActiveSync clients expect HTTPS, and this server only speaks plain HTTP on `LISTEN_ADDR` — it expects a reverse proxy to terminate TLS in front of it. See [Exposing it to real devices](#exposing-it-to-real-devices) below for the setup this project was tested against. Once that's in place, add an "Exchange"/"ActiveSync" account on the device with:
+ActiveSync clients expect HTTPS, and this server only speaks plain HTTP on `LISTEN_ADDR`. It expects a reverse proxy to terminate TLS in front of it. See [Exposing it to real devices](#exposing-it-to-real-devices) below for the setup this project was tested against. Once that's in place, add an "Exchange"/"ActiveSync" account on the device with:
 
 - **Server**: your reverse proxy's public hostname
 - **Username / Email**: the Carbonio account's own address
@@ -131,7 +131,7 @@ ActiveSync clients expect HTTPS, and this server only speaks plain HTTP on `LIST
 
 ## Exposing it to real devices
 
-ActiveSync clients require HTTPS, which this server doesn't terminate itself (`LISTEN_ADDR` is plain HTTP only, on purpose — TLS termination is a reverse proxy's job, not this project's). The setup this was verified against:
+ActiveSync clients require HTTPS, which this server doesn't terminate itself (`LISTEN_ADDR` is plain HTTP only, on purpose. TLS termination is a reverse proxy's job, not this project's). The setup this was verified against:
 
 ```
 Real device (Gmail app, etc.)
@@ -143,9 +143,9 @@ Real device (Gmail app, etc.)
 
 - A public-facing host runs nginx with a `certbot`-issued certificate for a subdomain, reverse-proxying `/Microsoft-Server-ActiveSync` to this server's address.
 - This server reaches that host over a WireGuard tunnel (as the client side, with `PersistentKeepalive` if it's behind NAT), so the public host can reach it without exposing your private network directly.
-- This server itself keeps running as a normal plain-HTTP service, same as [step 3](#3-configure-and-run) above — the reverse proxy is the only thing handling TLS.
+- This server itself keeps running as a normal plain-HTTP service, same as [step 3](#3-configure-and-run) above. The reverse proxy is the only thing handling TLS.
 
-None of this is specific to Carbonio or this project; it's the standard shape for exposing any internal HTTP service to a real ActiveSync client without that service needing its own public IP or certificate.
+None of this is specific to Carbonio or this project. It's the standard shape for exposing any internal HTTP service to a real ActiveSync client without that service needing its own public IP or certificate.
 
 ## Architecture
 
